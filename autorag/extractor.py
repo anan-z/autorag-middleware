@@ -87,15 +87,15 @@ class EntityExtractor:
 
     _PARAM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$", re.MULTILINE)
 
-    # Markdown bold pattern: **Label:** value
+    # Markdown bold pattern: **Label:** value (closing ** AFTER colon)
     _PARAM_MARKDOWN = re.compile(
-        r"^\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?)\*\*\s*[:=]\s*(.+?)\s*$",
+        r"^\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?):\*\*\s*(.+?)\s*$",
         re.MULTILINE,
     )
 
     # Markdown bullet pattern: * **Label:** value
     _PARAM_BULLET = re.compile(
-        r"^\s*[\*\-]\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?)\*\*\s*[:=]\s*(.+?)\s*$",
+        r"^\s*[\*\-]\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?):\*\*\s*(.+?)\s*$",
         re.MULTILINE,
     )
     _SUBJECT_MARKER = re.compile(r"^\s*\[\s*subject\s*:\s*([^\]]+)\]\s*$", re.MULTILINE | re.I)
@@ -207,16 +207,50 @@ class EntityExtractor:
 
     @staticmethod
     def _looks_like_parameter_value(value: str) -> bool:
+        """Accept data-like values including proper nouns, reject prose."""
         value = value.strip()
-        if not value or re.match(r"^[A-Za-z][A-Za-z\s]+$", value):
+        if not value:
             return False
-        return bool(
-            re.match(r"^-?\d+(?:\.\d+)?$", value)
-            or re.search(r"\d+\s*[a-zA-Z°Ωµ%]+", value)
-            or re.search(r"[€$£]\s*\d", value)
-            or re.match(r"^v?\d+(?:\.\d+)+(?:[-_][\w-]+)?$", value)
-            or re.match(r"^[A-Z]+[\w-]*\d+[\w-]*$", value)
-        )
+
+        # Remove parenthetical content for validation
+        value_clean = re.sub(r'\([^)]*\)', '', value).strip()
+        if not value_clean:
+            return False
+
+        # Reject: pure lowercase prose (e.g., "she looks up")
+        if re.match(r"^[a-z][a-z\s]+$", value_clean):
+            return False
+
+        # Accept: any number (including small integers)
+        if re.match(r"^-?\d+(?:\.\d+)?$", value_clean):
+            return True
+
+        # Accept: number with unit (10mm, 12V, 1.8°)
+        if re.search(r"\d+\s*[a-zA-Z°Ωµ%]+", value_clean):
+            return True
+
+        # Accept: currency ($50k, €12.50)
+        if re.search(r"[€$£]\s*\d", value_clean):
+            return True
+
+        # Accept: version (v2, 1.2.3)
+        if re.match(r"^v?\d+(?:\.\d+)+(?:[-_][\w-]+)?$", value_clean):
+            return True
+
+        # Accept: model identifier (NEMA17, BME280)
+        if re.match(r"^[A-Z]+[\w-]*\d+[\w-]*$", value_clean):
+            return True
+
+        # Accept: capitalized words (proper nouns like Ayanna, Nymph)
+        if re.match(r"^[A-Z][a-z]+$", value_clean):
+            return True
+
+        # Accept: multi-word with capitals (Black hair, Large eyes)
+        if re.match(r"^[A-Z][a-zA-Z\s,\-\/]+$", value_clean):
+            return True
+
+        # Fallback: accept if has digit
+        return bool(re.search(r"\d", value_clean))
 
     def preprocess_message(self, text: str) -> tuple[str, str]:
         markers = list(self._SUBJECT_MARKER.finditer(text))
@@ -246,7 +280,17 @@ class EntityExtractor:
             raw = self._clean_value(m.group(2))
             if not label or label in self._PARAM_STOP_LABELS or self._SUBJECT_MARKER.match(m.group(0)):
                 continue
-            parts = [self._clean_value(x) for x in re.split(r"[,;|]", raw)] if any(x in raw for x in ",;|") else [raw]
+
+            # Determine if this is a markdown pattern (don't split) or plain (split on commas)
+            is_markdown = '**' in m.group(0)
+
+            if is_markdown:
+                # For markdown patterns, keep the full value (don't split on commas)
+                parts = [raw]
+            else:
+                # For plain patterns, split on commas/semicolons/pipes
+                parts = [self._clean_value(x) for x in re.split(r"[,;|]", raw)] if any(x in raw for x in ",;|") else [raw]
+
             valid = [x for x in parts if self._looks_like_parameter_value(x)]
             for value in valid:
                 f = self._fact(subject, label, value, 0.90, from_assistant, "params")
