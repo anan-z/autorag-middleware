@@ -86,6 +86,18 @@ class EntityExtractor:
     EXPLICIT_FACT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+(?:has|owns|uses|lives in|works at|works for)\s+(.{2,100}?)(?=[.!?]|$)", re.I)
 
     _PARAM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$", re.MULTILINE)
+
+    # Markdown bold pattern: **Label:** value
+    _PARAM_MARKDOWN = re.compile(
+        r"^\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?)\*\*\s*[:=]\s*(.+?)\s*$",
+        re.MULTILINE,
+    )
+
+    # Markdown bullet pattern: * **Label:** value
+    _PARAM_BULLET = re.compile(
+        r"^\s*[\*\-]\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?)\*\*\s*[:=]\s*(.+?)\s*$",
+        re.MULTILINE,
+    )
     _SUBJECT_MARKER = re.compile(r"^\s*\[\s*subject\s*:\s*([^\]]+)\]\s*$", re.MULTILINE | re.I)
     _PARAM_STOP_LABELS = {"note", "warning", "example", "todo", "see", "also", "ref", "reference", "source", "hint", "tip", "important", "remember", "caution", "danger"}
 
@@ -222,7 +234,14 @@ class EntityExtractor:
         markers = list(self._SUBJECT_MARKER.finditer(text))
         if markers:
             subject = self._clean_subject(markers[-1].group(1))
-        for m in self._PARAM_LINE.finditer(text):
+
+        # Collect matches from all three patterns
+        all_matches = []
+        all_matches.extend(self._PARAM_LINE.finditer(text))
+        all_matches.extend(self._PARAM_MARKDOWN.finditer(text))
+        all_matches.extend(self._PARAM_BULLET.finditer(text))
+
+        for m in all_matches:
             label = self._normalize_param_label(m.group(1))
             raw = self._clean_value(m.group(2))
             if not label or label in self._PARAM_STOP_LABELS or self._SUBJECT_MARKER.match(m.group(0)):
