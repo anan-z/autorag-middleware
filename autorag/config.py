@@ -48,8 +48,8 @@ class ExtractionConfig(BaseModel):
     enabled: bool = True
     use_spacy: bool = False
     min_confidence: float = 0.55
-    mode: Literal["heuristic", "llm", "hybrid"] = "hybrid"
-    llm_every_n_turns: int = 1
+    mode: Literal["heuristic", "llm", "hybrid"] = "heuristic"
+    llm_every_n_turns: int = 0
     llm_max_tokens: int = 400
     llm_temperature: float = 0.1
 
@@ -63,7 +63,7 @@ class ValidationConfig(BaseModel):
     response_policy: Literal["off", "flag", "soft", "hard", "reconcile"] = "hard"
     max_retries: int = 1
     # Use same-model JSON claim extract for domain-neutral reality check
-    use_llm_claims: bool = True
+    use_llm_claims: bool = False
     # Optional pattern packs: e.g. ["rp"] for narrative stress-test patterns
     extra_patterns: list[str] = Field(default_factory=list)
 

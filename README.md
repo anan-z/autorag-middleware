@@ -1,174 +1,112 @@
-# AutoRAG Middleware 0.3.3
+# AutoRAG Middleware 0.4.0
 
-**Params pattern pack** for `Label: value` and multi-value parameter lists:
+Conversation-scoped external working memory for OpenAI-compatible local LLMs.
+
+The 0.4 design is deliberately **conservative**: polluted memory is worse than missed memory. The default extractor stores only high-signal durable facts and does not harvest arbitrary capitalized words, spaCy entities, adjectives, or narrative prose.
+
+## What is remembered
+
+Examples of high-signal facts:
+
+- `I left my car keys on the finger-take.` → `car keys.location = finger-take`
+- `Maya's hair is black.` → `Maya.hair_color = black`
+- `We decided to use PostgreSQL.` → `conversation.decision = use PostgreSQL`
+- `[subject: motor_a] Width: 42mm` → `motor_a.width = 42mm` (parameter pack)
+
+A sentence such as `A beautiful sunset painted the room gold.` creates **no memory**.
+
+## Conversation isolation
+
+Every fact is scoped to a conversation. Supply a stable ID with:
+
+```http
+X-Conversation-Id: my-chat-42
+```
+
+or a body field `conversation_id` / `session_id` / `chat_id`.
+
+Do not use the default bucket for multiple unrelated chats. A client integration should provide a stable per-chat ID.
+
+## Reality checking
+
+For JSON/non-streaming requests, the proxy can check the draft against existing memory before returning it. For example, if memory says `Maya.hair_color = black` and a draft says `Maya's red hair`, the configured policy can ask the same model to correct the draft.
+
+The default semantic claim extractor is OFF because it costs another model call and can itself introduce noise. Deterministic checks remain enabled.
+
+Streaming responses cannot be rewritten after bytes have already reached the client; their memory extraction happens after the stream. If you need hard response correction, use non-streaming mode.
+
+## LLM extraction
+
+If deterministic extraction misses too much, explicitly opt into the same-model structured extractor:
 
 ```yaml
-validation:
-  extra_patterns: [params]   # Enable Label: value extraction
+extraction:
+  mode: "llm"
+  llm_every_n_turns: 1
 ```
 
-Extracts durable facts from technical specs:
-```
-Width: 10              → params.width = "10"
-Voltage: 12V           → params.voltage = "12V"
-Dimensions: 42, 42, 48 → params.dimensions = "42mm" (×3 facts)
-```
+This is intentionally not the default.
 
-**Features:**
-- Single and multi-value parameter extraction
-- Subject marker support: `[subject: motor_a]` to disambiguate
-- Label normalization (`Step Angle` → `step_angle`)
-- Unit preservation (`12V`, `1.8°`, `42mm`)
-- Noise filtering (skips `Note:`, `Warning:`, prose)
-- Balanced validation (accepts `Iterations: 12`, rejects `Ayanna: she smiles`)
-- No marker leak to LLM (markers stripped before sending)
+## Purging one conversation
 
-# AutoRAG Middleware 0.3.2
+Use the supplied script instead of an ad-hoc SQL snippet:
 
-**Bug fixes:**
-
-- Turn resolution: only rollback on regenerate/swipe, not new messages
-- Generic durable facts in extractor (not just validator)
-- `max_turn()` database method for per-conversation turn tracking
-
-# AutoRAG Middleware 0.3.1
-
-**Domain-neutral long-conversation memory** (finance, product design, physics, research, everyday assistant).  
-Interactive fiction / RP is an optional stress pack (`validation.extra_patterns: [rp]`), not the core product.
-
-# AutoRAG Middleware 0.2.2
-
-Hardening over 0.2.1 (Claude review items):
-
-- Keep **all** system messages (only merge memory into the first)
-- **Background** extract/reconcile (reply returns immediately; per-conversation lock)
-- **Regenerate/swipe rollback**: deactivate facts for current turn+, restore superseded
-- **Per-request turn** = user-message count (not a global counter)
-- Extractor cleanup: no `re.I` on names, no possessive→owner noise, skip hedges, normalize subjects
-- Token-scored fact retrieval; fingerprint chat id when no `X-Conversation-Id`
-- Strip `<think>` before extraction; lifespan handler; correction prompt no longer doubles memory
-
-# AutoRAG Middleware 0.2.1
-
-Patch over 0.2.0: `--config` reaches the FastAPI process, deterministic embeddings (no `hash()` seed drift), default bind `127.0.0.1`, config fall-through when an explicit path is missing.
-
-# AutoRAG Middleware 0.2.0
-
-OpenAI-compatible **proxy** between your chat client (SillyTavern, Open WebUI, LMSA, …) and an LLM backend (LM Studio, Ollama, cloud).
-
-**What 0.2.0 adds**
-
-- **Conversation-scoped memory** — no cross-chat contamination  
-- **Structured facts** (`subject.predicate = object`) with supersession  
-- **Extract → Validate → Commit** pipeline  
-- **Optional same-model structured extraction** (hybrid / llm modes)  
-- **Conflict reconcile** via a tiny second call to the same backend  
-- Streaming + JSON completions  
-
-## Architecture
-
-```
-Client  ──►  AutoRAG Proxy  ──►  LLM Backend (Gemma / etc.)
-                │                      │
-                │                      │ optional extract / reconcile
-                ▼                      │
-         SQLite (per conversation)  ◄──┘
-         entities + facts + vectors
+```powershell
+python scripts/purge_conversation.py fp_bb11ae3ba671c312
 ```
 
-### Memory lifecycle
+It asks for confirmation. For automation:
 
-1. **Inject** relevant facts/entities for the active conversation into the system prompt  
-2. **Generate** (stream or JSON) via your backend  
-3. **Extract** durable facts (heuristic and/or same-model JSON)  
-4. **Validate** against existing facts; optional reconcile call on conflict  
-5. **Commit** (or keep existing / supersede)
+```powershell
+python scripts/purge_conversation.py fp_bb11ae3ba671c312 --yes
+```
+
+Optional explicit DB path:
+
+```powershell
+python scripts/purge_conversation.py fp_bb11ae3ba671c312 --db 'C:\Users\Anan\AppData\Local\autorag-middleware\state.db' --yes
+```
+
+Only that conversation's entities, facts, events, relationships, conversation state, vectors, and metadata are removed.
 
 ## Quick start
 
-```bash
-unzip autorag-middleware.zip
-cd autorag-middleware
-
+```powershell
 python -m venv venv
-# Windows: venv\Scripts\activate
-source venv/bin/activate
+venv\\Scripts\\activate
 pip install -e .
 python -m autorag
 ```
 
-Point the client at `http://127.0.0.1:8000/v1`.
-
-### Isolate chats
-
-Send header:
-
-```http
-X-Conversation-Id: my-rp-session-42
-```
-
-Or body field `conversation_id` / `session_id`.  
-Default id is `default` (everything shares one bucket if you omit it).
-
-### Config (`configs/default.yaml` or platformdirs config path)
-
-```yaml
-extraction:
-  mode: hybrid          # heuristic | llm | hybrid
-  llm_every_n_turns: 1
-
-validation:
-  enabled: true
-  on_conflict: reconcile  # off | flag | reconcile
-
-backends:
-  default:
-    api_base: "http://127.0.0.1:1234/v1"
-    api_key: "not-needed"
-    model: "your-model-id"
-```
-
-| `extraction.mode` | Behavior |
-|---|---|
-| `heuristic` | Regex/patterns only — no extra LLM calls |
-| `llm` | Structured JSON extract via same backend |
-| `hybrid` | Heuristic + LLM when candidates exist (or every N turns) |
-
-| `validation.on_conflict` | Behavior |
-|---|---|
-| `off` | Always supersede with the new value |
-| `flag` | Log conflict, still supersede |
-| `reconcile` | Extra same-model call; may keep existing |
-
-## Inspect memory
-
-```bash
-curl "http://127.0.0.1:8000/v1/state/facts?conversation_id=default"
-curl "http://127.0.0.1:8000/v1/state/entities?conversation_id=default"
-curl "http://127.0.0.1:8000/health"
-```
-
-## Example (car keys)
-
-1. Chat (with `X-Conversation-Id: home`): *“I can’t find my car keys.”* → model replies they are on the finger-take.  
-2. Hybrid extract stores `car keys.location = finger-take …` under conversation `home`.  
-3. Many turns later: *“Where did I leave my car keys?”* → injector puts that fact into the system block → model answers from memory.  
-4. Conversation `work` can store a different location for the same subject without clobbering `home`.
+Point LM Studio clients / SillyTavern / Open WebUI at `http://127.0.0.1:8000/v1`.
 
 ## Tests
 
-```bash
+```powershell
 pip install -e ".[dev]"
 pytest -q
 ```
 
-## Limitations
+## Architecture
 
-- LLM extract quality depends on your local model following the JSON schema.  
-- Heuristics alone will miss many free-form facts.  
-- Streaming path does not run the *response rewrite* continuity pass (fact pipeline still runs after the stream).  
-- Not a full lorebook manager — it is externalized working memory.  
+```text
+client
+  │
+  ▼
+AutoRAG proxy
+  ├── retrieve relevant facts for THIS conversation
+  ├── inject compact memory
+  ▼
+LM Studio / Gemma
+  │
+  ├── optional deterministic reality check
+  └── response
+  │
+  ▼
+conservative extractor
+  │
+  ▼
+SQLite (conversation-scoped facts)
+```
 
-## License
-
-MIT
+The project is intended for long-running finance, product design, physics, research, everyday-assistant, and RP conversations. RP is a useful stress test, not a special-case product mode.

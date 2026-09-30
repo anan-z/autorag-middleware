@@ -19,6 +19,16 @@ logger = logging.getLogger("autorag.validator")
 # Domain-neutral durable-claim patterns (cheap filter). Not RP-specific.
 # Optional packs can add more via config later.
 _GENERIC_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
+    (
+        re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['’]s\s+(red|black|blonde|brown|white|auburn|gray|grey|blue|green)\s+hair\b", re.I),
+        "hair_color",
+        "g1_g2",
+    ),
+    (
+        re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['’]s\s+hair\s+(?:is|was)\s+(red|black|blonde|brown|white|auburn|gray|grey)\b", re.I),
+        "hair_color",
+        "g1_g2",
+    ),
     # Name is N years old
     (
         re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+is\s+(\d{1,3})\s+years?\s+old\b"),
