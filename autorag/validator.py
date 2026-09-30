@@ -83,6 +83,20 @@ _RP_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     ),
 ]
 
+
+
+# Optional params / technical-spec patterns (enabled via validation.extra_patterns: params)
+_PARAMS_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
+    (
+        re.compile(
+            r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$",
+            re.MULTILINE,
+        ),
+        "param",
+        "label_value",
+    ),
+]
+
 _INTENTIONAL_HINTS = re.compile(
     r"\b(now|had become|turned|changed|after the|since the|no longer|used to be|"
     r"once was|updated to|revised to|instead|we now|going forward|from now on|"
@@ -154,6 +168,8 @@ class ResponseValidator:
         patterns = list(_GENERIC_PATTERNS)
         if "rp" in self.extra_patterns:
             patterns.extend(_RP_PATTERNS)
+        if "params" in self.extra_patterns:
+            patterns.extend(_PARAMS_PATTERNS)
         return patterns
 
     def extract_claim_candidates(

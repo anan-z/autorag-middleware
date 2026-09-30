@@ -29,7 +29,7 @@ validation:
   response_policy: "hard"
   max_retries: 1
   use_llm_claims: true   # domain-neutral claim extract via same backend
-  extra_patterns: []    # e.g. [rp] for narrative hair/eye patterns
+  extra_patterns: []    # e.g. [rp] for narrative, [params] for Label: value specs
 
 
 backends:

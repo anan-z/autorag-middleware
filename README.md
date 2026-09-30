@@ -1,24 +1,40 @@
+# AutoRAG Middleware 0.3.3
+
+**Params pattern pack** for `Label: value` and multi-value parameter lists:
+
+```yaml
+validation:
+  extra_patterns: [params]   # Enable Label: value extraction
+```
+
+Extracts durable facts from technical specs:
+```
+Width: 10              → params.width = "10"
+Voltage: 12V           → params.voltage = "12V"
+Dimensions: 42, 42, 48 → params.dimensions = "42mm" (×3 facts)
+```
+
+**Features:**
+- Single and multi-value parameter extraction
+- Subject marker support: `[subject: motor_a]` to disambiguate
+- Label normalization (`Step Angle` → `step_angle`)
+- Unit preservation (`12V`, `1.8°`, `42mm`)
+- Noise filtering (skips `Note:`, `Warning:`, prose)
+- Balanced validation (accepts `Iterations: 12`, rejects `Ayanna: she smiles`)
+- No marker leak to LLM (markers stripped before sending)
+
+# AutoRAG Middleware 0.3.2
+
+**Bug fixes:**
+
+- Turn resolution: only rollback on regenerate/swipe, not new messages
+- Generic durable facts in extractor (not just validator)
+- `max_turn()` database method for per-conversation turn tracking
+
 # AutoRAG Middleware 0.3.1
 
 **Domain-neutral long-conversation memory** (finance, product design, physics, research, everyday assistant).  
 Interactive fiction / RP is an optional stress pack (`validation.extra_patterns: [rp]`), not the core product.
-
-### Reality check (post-generation)
-
-1. Draft from the model  
-2. **LLM claim extract** (same backend, JSON) + generic durable-claim patterns  
-3. Compare to conversation-scoped SQLite facts  
-4. Policy: `hard` | `soft` | `reconcile` | `flag` | `off`  
-5. Background extract → validate → commit  
-
-RP-only patterns (hair/eyes) are **off by default**. Enable with:
-
-```yaml
-validation:
-  use_llm_claims: true
-  extra_patterns: [rp]   # optional narrative stress-test patterns
-  response_policy: hard
-```
 
 # AutoRAG Middleware 0.2.2
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "autorag-middleware"
-version = "0.3.2"
+version = "0.3.3"
 description = "Conversation-scoped state-tracking RAG middleware for LLM chat clients (OpenAI-compatible proxy)"
 readme = "README.md"
 requires-python = ">=3.10"

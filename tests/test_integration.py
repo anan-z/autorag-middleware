@@ -297,3 +297,96 @@ def test_decision_intentional_hint(db: StateDatabase):
     )
     assert conflicts
     assert conflicts[0]["intentional_hint"] is True
+
+
+# --- Params pattern pack tests (0.3.3) ---
+
+def test_params_single_value(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    facts = ext.extract_params("Width: 10\nLength: 20", from_assistant=False)
+    assert any(f["predicate"] == "width" and f["object"] == "10" for f in facts)
+    assert any(f["predicate"] == "length" and f["object"] == "20" for f in facts)
+
+
+def test_params_multi_value(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    facts = ext.extract_params("Dimensions: 42mm, 42mm, 48mm", from_assistant=False)
+    dims = [f for f in facts if f["predicate"] == "dimensions"]
+    assert len(dims) == 3  # Multiple facts, not JSON blob
+    assert any(f["object"] == "42mm" for f in dims)
+    assert any(f["object"] == "48mm" for f in dims)
+
+
+def test_params_noise_rejection(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    facts = ext.extract_params("Note: see above\nAyanna: she smiles", from_assistant=False)
+    assert len(facts) == 0
+
+
+def test_params_unit_preservation(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    facts = ext.extract_params("Voltage: 12V", from_assistant=False)
+    assert facts[0]["object"] == "12V"
+
+
+def test_params_supersession(db: StateDatabase):
+    db.commit_fact("c1", "params", "width", "10", turn_number=1)
+    db.commit_fact("c1", "params", "width", "12", turn_number=2)
+    assert db.get_active_fact("c1", "params", "width")["object"] == "12"
+
+
+def test_params_label_normalization(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    facts = ext.extract_params("Step Angle: 1.8°", from_assistant=False)
+    assert facts[0]["predicate"] == "step_angle"
+
+
+def test_params_subject_marker(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    text = "[subject: motor_a]\nWidth: 10\n[subject: motor_b]\nWidth: 15"
+    facts = ext.extract_params(text, from_assistant=False)
+
+    motor_a_width = [f for f in facts if f["subject"] == "motor_a" and f["predicate"] == "width"]
+    motor_b_width = [f for f in facts if f["subject"] == "motor_b" and f["predicate"] == "width"]
+
+    assert len(motor_a_width) == 1 and motor_a_width[0]["object"] == "10"
+    assert len(motor_b_width) == 1 and motor_b_width[0]["object"] == "15"
+
+
+def test_params_preprocess_strips_markers(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    text = "[subject: motor_a]\nWidth: 10"
+    clean, original = ext.preprocess_message(text)
+
+    # Clean text should not contain marker
+    assert "[subject:" not in clean
+    assert "Width: 10" in clean
+
+    # Original text retains marker for extraction
+    assert "[subject: motor_a]" in original
+
+
+def test_params_small_integers_accepted(db: StateDatabase):
+    from autorag.extractor import EntityExtractor
+    ext = EntityExtractor(db, use_spacy=False)
+    facts = ext.extract_params("Iterations: 12\nCount: 5", from_assistant=False)
+    assert any(f["predicate"] == "iterations" and f["object"] == "12" for f in facts)
+    assert any(f["predicate"] == "count" and f["object"] == "5" for f in facts)
+
+
+def test_params_in_validator(db: StateDatabase):
+    from autorag.validator import ResponseValidator
+    from autorag.extractor import EntityExtractor
+
+    db.commit_fact("c1", "params", "voltage", "12V", turn_number=1)
+    v = ResponseValidator(db, EntityExtractor(db), extra_patterns=["params"])
+    patterns = v._pattern_list()
+    # Should have generic + params patterns
+    assert len(patterns) > len(__import__('autorag.validator', fromlist=['_GENERIC_PATTERNS'])._GENERIC_PATTERNS)

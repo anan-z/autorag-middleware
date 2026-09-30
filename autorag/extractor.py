@@ -223,6 +223,7 @@ class EntityExtractor:
 
         facts: list[dict[str, Any]] = []
         facts.extend(self._generic_durable_facts(text, from_assistant=from_assistant))
+        facts.extend(self.extract_params(text, from_assistant=from_assistant))
         for pattern, etype, attr_key in self.PATTERNS:
             for m in pattern.finditer(text):
                 # Hedge check on surrounding window
@@ -350,7 +351,185 @@ class EntityExtractor:
 
         return out
 
-    def process_turn_heuristic(
+    
+    # --- Params pattern pack (Label: value) ---
+    # Fixed per DeepSeek review: no marker leak, correct collision detection,
+    # balanced noise filter, single regex architecture
+
+    _PARAM_LINE = re.compile(
+        r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$",
+        re.MULTILINE,
+    )
+
+    _SUBJECT_MARKER = re.compile(
+        r"^\s*\[\s*subject\s*:\s*([^\]]+)\]\s*$",
+        re.MULTILINE | re.IGNORECASE
+    )
+
+    _PARAM_STOP_LABELS = {
+        "note", "warning", "example", "todo", "e.g.", "i.e.",
+        "see", "also", "ref", "reference", "source", "hint", "tip",
+        "important", "remember", "caution", "danger"
+    }
+
+    @staticmethod
+    def _normalize_param_label(label: str) -> str:
+        """Step Angle → step_angle"""
+        label = label.strip().lower()
+        label = re.sub(r"[\s\-]+", "_", label)
+        label = re.sub(r"[^a-z0-9_]", "", label)
+        return label
+
+    @staticmethod
+    def _looks_like_parameter_value(value: str) -> bool:
+        """Accept data-like values, reject prose."""
+        value = value.strip()
+        if not value:
+            return False
+
+        # Accept: any number (including small integers like Iterations: 12)
+        if re.match(r"^-?\d+(\.\d+)?$", value):
+            return True
+
+        # Accept: number with unit (10mm, 12V, 1.8°)
+        if re.search(r"\d+\s*[a-zA-Z°Ωµµ]+", value):
+            return True
+
+        # Accept: currency ($50k, €12.50)
+        if re.search(r"[€$£]\d", value):
+            return True
+
+        # Accept: version (v2, 1.2.3)
+        if re.match(r"^v?\d+(\.\d+)*(-[\w\-]+)?$", value):
+            return True
+
+        # Accept: model identifier (NEMA17, BME280)
+        if re.match(r"^[A-Z]+[\w\-]*\d+[\w\-]*$", value):
+            return True
+
+        # Reject: pure words without digits ("red", "large", "auto")
+        if re.match(r"^[a-zA-Z\s]+$", value):
+            return False
+
+        # Fallback: accept if has digit
+        return bool(re.search(r"\d", value))
+
+    def preprocess_message(self, text: str) -> tuple[str, str]:
+        """
+        Strip subject markers from LLM-bound text, retain for extraction.
+        Returns (clean_text_for_llm, extraction_text_with_markers).
+        """
+        markers = list(self._SUBJECT_MARKER.finditer(text))
+        if not markers:
+            return text, text
+
+        # Build clean text (markers removed) for LLM
+        clean_parts = []
+        last_end = 0
+        for m in markers:
+            clean_parts.append(text[last_end:m.start()])
+            last_end = m.end()
+        clean_parts.append(text[last_end:])
+        clean_text = "".join(clean_parts)
+
+        return clean_text, text  # Original text with markers for extraction
+
+    def _check_param_collision(
+        self, conversation_id: str, label: str, new_subject: str
+    ) -> str | None:
+        """Check if label exists under different subject. Returns existing subject or None."""
+        all_facts = self.db.list_active_facts(conversation_id, limit=200)
+        for fact in all_facts:
+            if fact["predicate"] == label and fact["subject"] != new_subject:
+                return fact["subject"]
+        return None
+
+    def extract_params(self, text: str, *, from_assistant: bool) -> list[dict[str, Any]]:
+        """Extract Label: value parameters with subject marker support."""
+        out: list[dict[str, Any]] = []
+
+        # Parse subject markers to establish context
+        markers = [(m.start(), m.group(1).strip()) 
+                   for m in self._SUBJECT_MARKER.finditer(text)]
+
+        # Build segments with their subjects
+        segments: list[tuple[str, str]] = []
+        if markers:
+            # Text before first marker uses default subject
+            first_pos = markers[0][0]
+            if first_pos > 0:
+                segments.append(("params", text[:first_pos]))
+
+            for i, (pos, subject) in enumerate(markers):
+                end = markers[i+1][0] if i+1 < len(markers) else len(text)
+                segments.append((subject, text[pos:end]))
+        else:
+            segments.append(("params", text))
+
+        # Extract params from each segment
+        for subject, segment_text in segments:
+            for m in self._PARAM_LINE.finditer(segment_text):
+                label = self._normalize_param_label(m.group(1))
+                raw_value = m.group(2).strip()
+
+                # Skip stop labels
+                if label in self._PARAM_STOP_LABELS:
+                    continue
+
+                # Skip subject marker lines themselves
+                if self._SUBJECT_MARKER.match(m.group(0)):
+                    continue
+
+                # Check for multi-value (comma/semicolon/pipe separated)
+                if any(sep in raw_value for sep in [",", ";", "|"]):
+                    parts = [p.strip() for p in re.split(r"[,;|]", raw_value) if p.strip()]
+                    valid_parts = [p for p in parts if self._looks_like_parameter_value(p)]
+
+                    if len(valid_parts) > 1:
+                        # Store as multiple facts (better retrieval than JSON blob)
+                        for part in valid_parts:
+                            out.append(self._fact(
+                                subject=subject,
+                                predicate=label,
+                                object=part,
+                                confidence=0.85,
+                                from_assistant=from_assistant
+                            ))
+                    elif len(valid_parts) == 1:
+                        out.append(self._fact(
+                            subject=subject,
+                            predicate=label,
+                            object=valid_parts[0],
+                            confidence=0.9,
+                            from_assistant=from_assistant
+                        ))
+                else:
+                    # Single value
+                    if self._looks_like_parameter_value(raw_value):
+                        # Check for collision with different subject
+                        existing_subject = self._check_param_collision(
+                            getattr(self, 'conversation_id', 'default'), 
+                            label, subject
+                        )
+                        if existing_subject and subject == "params":
+                            logger.warning(
+                                "Param '%s' already exists under subject '%s'. "
+                                "Consider using [subject: X] marker to disambiguate.",
+                                label, existing_subject
+                            )
+
+                        out.append(self._fact(
+                            subject=subject,
+                            predicate=label,
+                            object=raw_value,
+                            confidence=0.9,
+                            from_assistant=from_assistant
+                        ))
+
+        return out
+
+
+def process_turn_heuristic(
         self,
         conversation_id: str,
         user_text: str,
