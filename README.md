@@ -64,7 +64,7 @@ python scripts/purge_conversation.py fp_bb11ae3ba671c312 --yes
 Optional explicit DB path:
 
 ```powershell
-python scripts/purge_conversation.py fp_bb11ae3ba671c312 --db 'C:\Users\Anan\AppData\Local\autorag-middleware\state.db' --yes
+python scripts/purge_conversation.py fp_bb11ae3ba671c312 --db '%LOCALAPPDATA%\autorag-middleware\state.db' --yes
 ```
 
 Only that conversation's entities, facts, events, relationships, conversation state, vectors, and metadata are removed.
