@@ -1,4 +1,4 @@
-# AutoRAG Middleware 0.4.0
+# AutoRAG Middleware 0.4.1
 
 Conversation-scoped external working memory for OpenAI-compatible local LLMs.
 
