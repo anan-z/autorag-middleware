@@ -49,11 +49,36 @@ def strip_reasoning(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
 
-
-
 def _normalize_subject(value: str) -> str:
     value = re.sub(r"\s+", " ", (value or "").strip())
     return value
+
+
+# Property labels that should NOT be promoted to their own subject.
+# If a param line's label is in this set, it stays a predicate of the
+# current subject (from marker or "params" fallback). Otherwise, if the
+# label looks like a proper noun and the value looks like data, the label
+# is promoted to the subject (definition-line case).
+_KNOWN_PROPERTY_LABELS = {
+    "width", "height", "length", "depth", "thickness", "radius", "diameter",
+    "weight", "mass", "volume", "area", "size",
+    "price", "cost", "value", "budget", "reserve", "balance",
+    "age", "count", "quantity", "iterations", "steps", "turns",
+    "voltage", "current", "resistance", "power", "wattage", "amperage",
+    "frequency", "speed", "temperature", "pressure",
+    "model", "version", "revision", "status", "state", "type", "kind",
+    "name", "title", "label", "id", "identifier", "key",
+    "location", "position", "address", "coordinates",
+    "color", "colour", "material", "finish",
+    "capacity", "limit", "quota", "threshold", "timeout", "interval",
+    "description", "summary", "note", "comment",
+    "start", "end", "duration", "deadline", "date", "time",
+    "author", "owner", "creator", "user",
+    "language", "framework", "library", "platform", "engine",
+    "protocol", "format", "encoding", "schema",
+    "host", "port", "url", "uri", "path", "endpoint",
+}
+
 
 class EntityExtractor:
     """Conservative, domain-neutral durable-memory extractor.
@@ -78,9 +103,9 @@ class EntityExtractor:
         r"\b(?:the|my|our|your|his|her|their)\s+(.{2,60}?)\s+(?:is|are|was|were)\s+(?:on|in|at|under|inside|beside|behind|near)\s+(?:the\s+)?(.{2,60}?)(?=[.!?,;]|$)", re.I
     )
     AGE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+is\s+(\d{1,3})\s+years?\s+old\b")
-    HAIR_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['’]s\s+hair\s+(?:is|was)\s+([A-Za-z-]{2,20})\b", re.I)
+    HAIR_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['\u2019]s\s+hair\s+(?:is|was)\s+([A-Za-z-]{2,20})\b", re.I)
     HAIR2_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+has\s+([A-Za-z-]{2,20})\s+hair\b", re.I)
-    EYES_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['’]s\s+eyes\s+(?:are|were)\s+([A-Za-z-]{2,20})\b", re.I)
+    EYES_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['\u2019]s\s+eyes\s+(?:are|were)\s+([A-Za-z-]{2,20})\b", re.I)
     DECISION_RE = re.compile(r"\b(?:we|I)\s+(?:decided|agreed|settled on|chose|selected|rejected|assumed|will use|are using)\s+(?:that\s+)?(.{4,160}?)(?=[.!?]|$)", re.I)
     REQUIREMENT_RE = re.compile(r"\b(?:must|shall|required to|needs to|need to|should remain|has to)\s+(.{4,160}?)(?=[.!?]|$)", re.I)
     EXPLICIT_FACT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+(?:has|owns|uses|lives in|works at|works for)\s+(.{2,100}?)(?=[.!?]|$)", re.I)
@@ -114,8 +139,8 @@ class EntityExtractor:
 
     def _strip_bracketed_content(self, text: str) -> str:
         text = re.sub(r"\[[^\]]*\]", " ", text)
-        text = re.sub(r"\【[^\】]*\】", " ", text)
-        text = re.sub(r"\〔[^\〕]*\〕", " ", text)
+        text = re.sub(r"\u3010[^\u3011]*\u3011", " ", text)
+        text = re.sub(r"\u300c[^\u300d]*\u300d", " ", text)
         return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
@@ -225,12 +250,12 @@ class EntityExtractor:
         if re.match(r"^-?\d+(?:\.\d+)?$", value_clean):
             return True
 
-        # Accept: number with unit (10mm, 12V, 1.8°)
-        if re.search(r"\d+\s*[a-zA-Z°Ωµ%]+", value_clean):
+        # Accept: number with unit (10mm, 12V, 1.8 deg)
+        if re.search(r"\d+\s*[a-zA-Z\u00b0\u03a9\u00b5%]+", value_clean):
             return True
 
-        # Accept: currency ($50k, €12.50)
-        if re.search(r"[€$£]\s*\d", value_clean):
+        # Accept: currency ($50k, EUR 12.50)
+        if re.search(r"[\u20ac$\u00a3]\s*\d", value_clean):
             return True
 
         # Accept: version (v2, 1.2.3)
@@ -262,33 +287,83 @@ class EntityExtractor:
         clean_parts.append(text[last_end:])
         return "".join(clean_parts), text
 
+    def _collect_param_matches(self, text: str) -> list[tuple[int, re.Match]]:
+        """Collect all param matches with their start positions, in document order."""
+        matches: list[tuple[int, re.Match]] = []
+        for rx in (self._PARAM_LINE, self._PARAM_MARKDOWN, self._PARAM_BULLET):
+            for m in rx.finditer(text):
+                matches.append((m.start(), m))
+        matches.sort(key=lambda x: x[0])
+        return matches
+
+    def _is_definition_line(self, label: str, value: str) -> bool:
+        """True if this looks like 'Squarebox: 1m x 1m x 1m' -- a subject definition.
+
+        Heuristic: the label is capitalized like a proper noun, it's not a
+        known property name, and the value looks like data.
+        """
+        normalized = self._normalize_param_label(label)
+        if not normalized:
+            return False
+        if normalized in _KNOWN_PROPERTY_LABELS:
+            return False
+        # Label must start with a capital letter (proper-noun-like)
+        if not label[:1].isupper():
+            return False
+        # Must be a single token or two-token identifier, not a sentence
+        if len(label.split()) > 2:
+            return False
+        # Value must look like data, not prose
+        if not self._looks_like_parameter_value(value):
+            return False
+        return True
+
     def extract_params(self, text: str, *, from_assistant: bool) -> list[dict[str, Any]]:
-        out = []
-        subject = "params"
-        markers = list(self._SUBJECT_MARKER.finditer(text))
-        if markers:
-            subject = self._clean_subject(markers[-1].group(1))
+        out: list[dict[str, Any]] = []
 
-        # Collect matches from all three patterns
-        all_matches = []
-        all_matches.extend(self._PARAM_LINE.finditer(text))
-        all_matches.extend(self._PARAM_MARKDOWN.finditer(text))
-        all_matches.extend(self._PARAM_BULLET.finditer(text))
+        # Walk the text in document order so that each [subject: X] marker
+        # applies only to the params that follow it, up to the next marker.
+        marker_positions = [(m.start(), self._clean_subject(m.group(1))) for m in self._SUBJECT_MARKER.finditer(text)]
+        param_matches = self._collect_param_matches(text)
 
-        for m in all_matches:
-            label = self._normalize_param_label(m.group(1))
-            raw = self._clean_value(m.group(2))
-            if not label or label in self._PARAM_STOP_LABELS or self._SUBJECT_MARKER.match(m.group(0)):
+        def current_subject(pos: int) -> str:
+            subject = "params"
+            for m_pos, m_subject in marker_positions:
+                if m_pos <= pos:
+                    subject = m_subject
+                else:
+                    break
+            return subject
+
+        for pos, m in param_matches:
+            # Skip if the whole match is actually a subject marker
+            if self._SUBJECT_MARKER.match(m.group(0)):
                 continue
 
-            # Determine if this is a markdown pattern (don't split) or plain (split on commas)
-            is_markdown = '**' in m.group(0)
+            label = self._normalize_param_label(m.group(1))
+            raw = self._clean_value(m.group(2))
+            if not label or label in self._PARAM_STOP_LABELS:
+                continue
 
+            # Definition-line promotion: "Squarebox: 1m x 1m x 1m"
+            if self._is_definition_line(m.group(1), raw):
+                definition_subject = self._normalize_param_label(m.group(1))
+                # Multi-value: split on x, comma, semicolon, pipe
+                parts = [self._clean_value(x) for x in re.split(r"[x\u00d7,;|]", raw) if self._clean_value(x)]
+                valid = [x for x in parts if self._looks_like_parameter_value(x)]
+                if valid:
+                    f = self._fact(definition_subject, "value", " ".join(valid), 0.85, from_assistant, "params")
+                    if f: out.append(f)
+                continue
+
+            # Attribute line: use current subject (from marker, or "params")
+            subject = current_subject(pos)
+
+            # Markdown patterns keep the full value; plain patterns split on separators
+            is_markdown = '**' in m.group(0)
             if is_markdown:
-                # For markdown patterns, keep the full value (don't split on commas)
                 parts = [raw]
             else:
-                # For plain patterns, split on commas/semicolons/pipes
                 parts = [self._clean_value(x) for x in re.split(r"[,;|]", raw)] if any(x in raw for x in ",;|") else [raw]
 
             valid = [x for x in parts if self._looks_like_parameter_value(x)]

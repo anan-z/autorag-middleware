@@ -178,3 +178,34 @@ def test_json_proxy_reality_check_can_correct_draft(tmp_path):
     assert b"black hair" in result.body
     assert len(calls) == 2
     asyncio.run(proxy.close())
+
+def test_params_two_markers_two_subjects(tmp_path):
+    """Regression: [subject: A] ... [subject: B] must not misattribute A's params to B."""
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    text = "[subject: motor_a]\nWidth: 42mm\n\n[subject: motor_b]\nWidth: 15mm"
+    facts = ext.extract_fact_candidates(text)
+    vals = {(f["subject"].lower(), f["predicate"], f["object"]) for f in facts}
+    assert ("motor_a", "width", "42mm") in vals
+    assert ("motor_b", "width", "15mm") in vals
+    # Ensure A's width did NOT get attributed to B
+    assert ("motor_b", "width", "42mm") not in vals
+
+
+def test_params_definition_line_promotes_label_to_subject(tmp_path):
+    """Squarebox: 1m x 1m x 1m -> squarebox.value = '1m 1m 1m'."""
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("Squarebox: 1m x 1m x 1m\nWoodencabinet: 170cm x 80cm x 60cm")
+    vals = {(f["subject"].lower(), f["predicate"]) for f in facts}
+    assert ("squarebox", "value") in vals
+    assert ("woodencabinet", "value") in vals
+
+
+def test_params_attribute_under_marker_not_promoted(tmp_path):
+    """A known property label under a marker stays a predicate, not a subject."""
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("[subject: motor_a]\nWidth: 42mm\nHeight: 15mm")
+    vals = {(f["subject"].lower(), f["predicate"], f["object"]) for f in facts}
+    assert ("motor_a", "width", "42mm") in vals
+    assert ("motor_a", "height", "15mm") in vals
+    # Width should NOT have been promoted to its own subject
+    assert not any(f["subject"].lower() == "width" for f in facts)
