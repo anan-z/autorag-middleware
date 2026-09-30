@@ -529,7 +529,7 @@ class EntityExtractor:
         return out
 
 
-def process_turn_heuristic(
+    def process_turn_heuristic(
         self,
         conversation_id: str,
         user_text: str,
