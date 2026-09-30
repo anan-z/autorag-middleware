@@ -54,12 +54,12 @@ def _normalize_subject(value: str) -> str:
     return value
 
 
-# Property labels that should NOT be promoted to their own subject.
-# If a param line's label is in this set, it stays a predicate of the
-# current subject (from marker or "params" fallback). Otherwise, if the
-# label looks like a proper noun and the value looks like data, the label
-# is promoted to the subject (definition-line case).
+# Labels that should NEVER become their own subject. If a param line's label
+# is in this set, it stays a predicate of the current subject. This includes:
+#   - technical property labels (Width, Height, Voltage, ...)
+#   - persona/character-sheet labels (Hair, Eyes, Build, Traits, ...)
 _KNOWN_PROPERTY_LABELS = {
+    # --- technical ---
     "width", "height", "length", "depth", "thickness", "radius", "diameter",
     "weight", "mass", "volume", "area", "size",
     "price", "cost", "value", "budget", "reserve", "balance",
@@ -77,6 +77,15 @@ _KNOWN_PROPERTY_LABELS = {
     "language", "framework", "library", "platform", "engine",
     "protocol", "format", "encoding", "schema",
     "host", "port", "url", "uri", "path", "endpoint",
+
+    # --- persona / character-sheet (so they don't become subjects) ---
+    "hair", "hair_color", "eye_color", "eyes", "skin", "build", "race",
+    "breasts", "genitals", "bottom", "nicknames", "nickname",
+    "traits", "reputation", "visual_impression", "appearance",
+    "current_clothing", "clothing", "outfit", "attire", "mental_state",
+    "mood", "emotional_state",  "chest", "physicality", "physique",
+    "frame", "stature", "sensory_suite", "physical_magnetism",
+    "sensitivity", "arousal", "libido",
 }
 
 
@@ -110,20 +119,19 @@ class EntityExtractor:
     REQUIREMENT_RE = re.compile(r"\b(?:must|shall|required to|needs to|need to|should remain|has to)\s+(.{4,160}?)(?=[.!?]|$)", re.I)
     EXPLICIT_FACT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+(?:has|owns|uses|lives in|works at|works for)\s+(.{2,100}?)(?=[.!?]|$)", re.I)
 
-    _PARAM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$", re.MULTILINE)
+    _PARAM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ \-\/]{0,40}?)\s*[:=]\s*(.+?)\s*$", re.MULTILINE)
 
-    # Markdown bold pattern: **Label:** value (closing ** AFTER colon)
     _PARAM_MARKDOWN = re.compile(
         r"^\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?):\*\*\s*(.+?)\s*$",
         re.MULTILINE,
     )
 
-    # Markdown bullet pattern: * **Label:** value
     _PARAM_BULLET = re.compile(
         r"^\s*[\*\-]\s*\*\*([A-Za-z][A-Za-z0-9_ \-\/]{0,50}?):\*\*\s*(.+?)\s*$",
         re.MULTILINE,
     )
     _SUBJECT_MARKER = re.compile(r"^\s*\[\s*subject\s*:\s*([^\]]+)\]\s*$", re.MULTILINE | re.I)
+    _NAME_FIELD = re.compile(r"^\s*(?:[\*\-]\s*)?(?:\*\*)?\s*Name\s*(?:\*\*)?\s*[:=]\s*(.+?)\s*$", re.MULTILINE | re.I)
     _PARAM_STOP_LABELS = {"note", "warning", "example", "todo", "see", "also", "ref", "reference", "source", "hint", "tip", "important", "remember", "caution", "danger"}
 
     def __init__(self, db: StateDatabase, use_spacy: bool = False, min_confidence: float = 0.70):
@@ -149,7 +157,9 @@ class EntityExtractor:
 
     @staticmethod
     def _clean_subject(value: str) -> str:
-        value = re.sub(r"\s+", " ", value.strip(" \t\r\n.,;:!?"))
+        # Remove markdown emphasis characters
+        value = value.replace("*", "")
+        value = re.sub(r"\s+", " ", value.strip(" \t\r\n.,;:!?-"))
         return _normalize_subject(value) or value
 
     def _valid_subject(self, subject: str) -> bool:
@@ -183,8 +193,6 @@ class EntityExtractor:
             return []
         text = strip_reasoning(text or "")
         clean = self._strip_bracketed_content(text)
-        # A hedged statement is not durable memory. Reject the whole turn rather
-        # than accidentally capturing the asserted-looking fragment inside it.
         if self.HEDGE_RE.search(clean):
             return []
         out: list[dict[str, Any]] = []
@@ -193,7 +201,6 @@ class EntityExtractor:
             f = self._fact(subject, pred, obj, conf, from_assistant, source)
             if f: out.append(f)
 
-        # Explicit locations: this is the important everyday-assistant case.
         for rx in (self.LOCATION_RE, self.POSSESSION_LOCATION_RE):
             for m in rx.finditer(clean):
                 add(m.group(1), "location", m.group(2), 0.90)
@@ -214,10 +221,8 @@ class EntityExtractor:
         for m in self.EXPLICIT_FACT_RE.finditer(clean):
             add(m.group(1), "association", m.group(2), 0.82)
 
-        # Technical parameter pack remains opt-in and data-shaped only.
         out.extend(self.extract_params(text, from_assistant=from_assistant))
 
-        # Deduplicate exact candidates.
         unique = {}
         for f in out:
             key = (f["subject"].lower(), f["predicate"], f["object"].lower())
@@ -227,51 +232,63 @@ class EntityExtractor:
     @staticmethod
     def _normalize_param_label(label: str) -> str:
         label = label.strip().lower()
-        label = re.sub(r"[\s\-]+", "_", label)
+        # Treat whitespace, dashes, and slashes as separators before stripping.
+        label = re.sub(r"[\s\-/]+", "_", label)
         return re.sub(r"[^a-z0-9_]", "", label)
 
     @staticmethod
     def _looks_like_parameter_value(value: str) -> bool:
-        """Accept data-like values including proper nouns, reject prose."""
+        """Accept data-like values including proper nouns and short prose, reject sentences."""
         value = value.strip()
         if not value:
             return False
 
-        # Remove parenthetical content for validation
         value_clean = re.sub(r'\([^)]*\)', '', value).strip()
         if not value_clean:
             return False
 
-        # Reject: pure lowercase prose (e.g., "she looks up")
-        if re.match(r"^[a-z][a-z\s]+$", value_clean):
+        # Reject sentences (many words with no data signal)
+        words = value_clean.split()
+        if len(words) > 6 and not re.search(r"\d", value_clean):
+            return False
+
+        # Reject obvious prose verbs: single lowercase word preceded by a pronoun
+        # is not a problem here (we've already split), but reject values that
+        # look like full clauses: "she looks up", "it was blue"
+        if re.match(r"^(?:he|she|it|they|we|i)\s+[a-z]+", value_clean, re.I):
             return False
 
         # Accept: any number (including small integers)
         if re.match(r"^-?\d+(?:\.\d+)?$", value_clean):
             return True
 
-        # Accept: number with unit (10mm, 12V, 1.8 deg)
+        # Accept: number with unit
         if re.search(r"\d+\s*[a-zA-Z\u00b0\u03a9\u00b5%]+", value_clean):
             return True
 
-        # Accept: currency ($50k, EUR 12.50)
+        # Accept: currency
         if re.search(r"[\u20ac$\u00a3]\s*\d", value_clean):
             return True
 
-        # Accept: version (v2, 1.2.3)
+        # Accept: version
         if re.match(r"^v?\d+(?:\.\d+)+(?:[-_][\w-]+)?$", value_clean):
             return True
 
-        # Accept: model identifier (NEMA17, BME280)
+        # Accept: model identifier
         if re.match(r"^[A-Z]+[\w-]*\d+[\w-]*$", value_clean):
             return True
 
-        # Accept: capitalized words (proper nouns like Ayanna, Nymph)
-        if re.match(r"^[A-Z][a-z]+$", value_clean):
+        # Accept: capitalized word(s) — proper nouns, colors, traits
+        if re.match(r"^[A-Z][a-zA-Z0-9\s,\-\/\(\)']+$", value_clean):
             return True
 
-        # Accept: multi-word with capitals (Black hair, Large eyes)
-        if re.match(r"^[A-Z][a-zA-Z\s,\-\/]+$", value_clean):
+        # Accept: multi-value lists with commas (already split, so this catches leftovers)
+        if "," in value_clean and len(value_clean) < 120:
+            return True
+
+        # Accept: short lowercase adjective-like values (colors, shapes, states)
+        # e.g. "blue", "almond-shaped", "round", "hairless"
+        if re.match(r"^[a-z][a-z\-]{1,20}$", value_clean):
             return True
 
         # Fallback: accept if has digit
@@ -288,7 +305,6 @@ class EntityExtractor:
         return "".join(clean_parts), text
 
     def _collect_param_matches(self, text: str) -> list[tuple[int, re.Match]]:
-        """Collect all param matches with their start positions, in document order."""
         matches: list[tuple[int, re.Match]] = []
         for rx in (self._PARAM_LINE, self._PARAM_MARKDOWN, self._PARAM_BULLET):
             for m in rx.finditer(text):
@@ -299,35 +315,54 @@ class EntityExtractor:
     def _is_definition_line(self, label: str, value: str) -> bool:
         """True if this looks like 'Squarebox: 1m x 1m x 1m' -- a subject definition.
 
-        Heuristic: the label is capitalized like a proper noun, it's not a
-        known property name, and the value looks like data.
+        Does NOT fire for known property labels (Width, Hair, Eyes, ...).
+        Does NOT fire for labels with spaces or all-lowercase (e.g. 'current clothing').
+        Requires a single capitalized token or CapCase identifier.
         """
         normalized = self._normalize_param_label(label)
         if not normalized:
             return False
         if normalized in _KNOWN_PROPERTY_LABELS:
             return False
-        # Label must start with a capital letter (proper-noun-like)
-        if not label[:1].isupper():
-            return False
-        # Must be a single token or two-token identifier, not a sentence
+        # Must be a single token or two-token identifier
         if len(label.split()) > 2:
             return False
-        # Value must look like data, not prose
+        # Must not contain spaces (that rules out "current clothing")
+        if " " in label.strip():
+            return False
+        # Must start with a capital and contain at least one letter
+        if not label[:1].isupper():
+            return False
+        if not re.match(r"^[A-Z][A-Za-z0-9_]*$", label):
+            return False
+        # Value must look like data
         if not self._looks_like_parameter_value(value):
             return False
         return True
 
     def extract_params(self, text: str, *, from_assistant: bool) -> list[dict[str, Any]]:
+        # Do not extract param lines from assistant output. The model's
+        # re-statements of character sheets and spec tables produce duplicate
+        # facts and unreliable subjects. Params should come from the user.
+        if from_assistant:
+            return []
         out: list[dict[str, Any]] = []
 
-        # Walk the text in document order so that each [subject: X] marker
-        # applies only to the params that follow it, up to the next marker.
         marker_positions = [(m.start(), self._clean_subject(m.group(1))) for m in self._SUBJECT_MARKER.finditer(text)]
+        name_field = self._NAME_FIELD.search(text)
+
+        # Determine default subject from a Name: field if present, else "params"
+        default_subject = "params"
+        if name_field:
+            name_value = self._clean_subject(name_field.group(1))
+            # Only use if it looks like a single token / short identifier
+            if name_value and len(name_value) <= 40:
+                default_subject = name_value
+
         param_matches = self._collect_param_matches(text)
 
         def current_subject(pos: int) -> str:
-            subject = "params"
+            subject = default_subject
             for m_pos, m_subject in marker_positions:
                 if m_pos <= pos:
                     subject = m_subject
@@ -336,8 +371,10 @@ class EntityExtractor:
             return subject
 
         for pos, m in param_matches:
-            # Skip if the whole match is actually a subject marker
             if self._SUBJECT_MARKER.match(m.group(0)):
+                continue
+            # Skip the Name: field itself as a param (already used as subject)
+            if self._NAME_FIELD.match(m.group(0)):
                 continue
 
             label = self._normalize_param_label(m.group(1))
@@ -345,10 +382,9 @@ class EntityExtractor:
             if not label or label in self._PARAM_STOP_LABELS:
                 continue
 
-            # Definition-line promotion: "Squarebox: 1m x 1m x 1m"
+            # Definition-line promotion (only for non-property labels)
             if self._is_definition_line(m.group(1), raw):
                 definition_subject = self._normalize_param_label(m.group(1))
-                # Multi-value: split on x, comma, semicolon, pipe
                 parts = [self._clean_value(x) for x in re.split(r"[x\u00d7,;|]", raw) if self._clean_value(x)]
                 valid = [x for x in parts if self._looks_like_parameter_value(x)]
                 if valid:
@@ -356,17 +392,22 @@ class EntityExtractor:
                     if f: out.append(f)
                 continue
 
-            # Attribute line: use current subject (from marker, or "params")
             subject = current_subject(pos)
 
-            # Markdown patterns keep the full value; plain patterns split on separators
             is_markdown = '**' in m.group(0)
             if is_markdown:
-                parts = [raw]
+                # For markdown, split on commas into multiple values but keep them
+                # under the same subject+label (each becomes its own fact).
+                parts = [self._clean_value(x) for x in re.split(r"[,;]", raw)] if any(x in raw for x in ",;") else [raw]
             else:
                 parts = [self._clean_value(x) for x in re.split(r"[,;|]", raw)] if any(x in raw for x in ",;|") else [raw]
 
             valid = [x for x in parts if self._looks_like_parameter_value(x)]
+            # If splitting destroyed the value (e.g. "Large, almond-shaped, blue" -> parts rejected),
+            # fall back to the original raw value as a single object.
+            if len(valid) < len(parts) and self._looks_like_parameter_value(raw):
+                valid = [raw]
+
             for value in valid:
                 f = self._fact(subject, label, value, 0.90, from_assistant, "params")
                 if f: out.append(f)
@@ -375,7 +416,6 @@ class EntityExtractor:
     def process_turn_heuristic(self, user_text: str, assistant_text: str, turn_number: int, conversation_id: str):
         self.conversation_id = conversation_id
         facts = self.extract_fact_candidates(user_text, from_assistant=False) + self.extract_fact_candidates(assistant_text, from_assistant=True)
-        # Never store entities from prose. Entities are created only for explicit fact subjects.
         subjects = {f["subject"] for f in facts if f["subject"].lower() != "conversation" and f["subject"].lower() != "params"}
         for subject in subjects:
             self.db.upsert_entity(conversation_id, subject, "unknown", {"source": "fact_subject"}, 0.80)
@@ -398,6 +438,4 @@ class MemoryPipeline:
         self.llm_temperature = llm_temperature
 
     async def process_turn(self, conversation_id: str, user_text: str, assistant_text: str, turn_number: int, llm_complete=None):
-        # Deterministic path first. The proxy has already performed its response
-        # consistency pass for JSON requests; streaming uses this post-pass.
         return self.extractor.process_turn_heuristic(user_text, assistant_text, turn_number, conversation_id)

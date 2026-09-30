@@ -209,3 +209,59 @@ def test_params_attribute_under_marker_not_promoted(tmp_path):
     assert ("motor_a", "height", "15mm") in vals
     # Width should NOT have been promoted to its own subject
     assert not any(f["subject"].lower() == "width" for f in facts)
+
+def test_character_sheet_name_field_sets_subject(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    text = "Name: Ayanna\nAge: 19\nHair: Black, waist-length\nEyes: Large, almond-shaped, blue"
+    facts = ext.extract_fact_candidates(text)
+    vals = {(f["subject"].lower(), f["predicate"], f["object"]) for f in facts}
+    # All attributes attributed to Ayanna, not to bare 'hair'/'eyes'
+    assert ("ayanna", "age", "19") in vals
+    assert ("ayanna", "hair", "Black, waist-length") in vals or ("ayanna", "hair", "Black") in vals
+    # 'hair' and 'eyes' should NOT be subjects
+    assert not any(f["subject"].lower() in {"hair", "eyes", "build"} for f in facts)
+
+
+def test_multi_value_keeps_full_string_when_split_fails(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("Name: Ayanna\nEyes: Large, almond-shaped, blue")
+    eyes_facts = [f for f in facts if f["predicate"] == "eyes"]
+    assert eyes_facts
+    # Either the whole string was kept, or all three parts were kept
+    objects = {f["object"] for f in eyes_facts}
+    assert "Large, almond-shaped, blue" in objects or {"Large", "almond-shaped", "blue"}.issubset(objects)
+
+
+def test_definition_line_does_not_fire_for_lowercase_label(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    # 'current clothing' has a space and lowercase — must not become a subject
+    facts = ext.extract_fact_candidates("current clothing: None (Naked)")
+    assert not any(f["subject"].lower() == "current_clothing" for f in facts)
+
+def test_subject_and_label_hygiene(tmp_path):
+    """Regression: markdown asterisks must not leak into subjects, and slash-separated labels must not concatenate."""
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    text = (
+        "**Name:** Ayanna\n"
+        "Age: 19\n"
+        "Height/Weight: 164cm / 49kg\n"
+        "Sensitive/Sensual: Highly responsive to touch\n"
+        "Chest: DD cup round full\n"
+    )
+    facts = ext.extract_fact_candidates(text)
+    # No fact should have a subject containing '*'
+    assert not any("*" in f["subject"] for f in facts), \
+        f"Subject leaked markdown: {[f['subject'] for f in facts]}"
+    # No predicate should contain concatenated words like 'heightweight'
+    predicates = {f["predicate"] for f in facts}
+    assert "heightweight" not in predicates
+    assert "sensitivesensual" not in predicates
+    # Slash-separated labels should split on underscore, and the facts
+    # should actually be extracted (not silently dropped).
+    assert "height_weight" in predicates, f"missing height_weight; got {predicates}"
+    assert "sensitive_sensual" in predicates, f"missing sensitive_sensual; got {predicates}"
+    # Chest should not become its own subject
+    assert not any(f["subject"].lower() == "chest" for f in facts)
+    # All subjects should be 'Ayanna' (the Name: field established it)
+    subjects = {f["subject"] for f in facts}
+    assert subjects == {"Ayanna"}, f"unexpected subjects: {subjects}"
