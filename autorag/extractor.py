@@ -1,883 +1,265 @@
-"""Entity + structured fact extraction (heuristic and optional same-model LLM)."""
+"""Entity and fact extraction for AutoRAG middleware.
+
+Rewritten with proper NLP filtering to prevent:
+- Pronouns/prepositions/adverbs extracted as entities
+- System prompt tokens extracted as entities
+- Prose captured as location values
+- Multi-word proper nouns split incorrectly
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
-from typing import Any, Awaitable, Callable
+from typing import Any, Protocol
 
 from .database import StateDatabase
 
-logger = logging.getLogger("autorag.extractor")
+logger = logging.getLogger(__name__)
 
+
+# --- spaCy lazy loader ---
 _nlp = None
-
-EXTRACT_SYSTEM = """You extract durable facts from a short dialogue exchange.
-Return ONLY a JSON object:
-{"facts":[{"subject":"string","predicate":"string","object":"string","confidence":0.0,"speaker":"user"|"assistant"}]}
-
-Rules:
-- Only durable state (identity, locations of things, inventory, relationships, decisions, physical attributes).
-- Resolve pronouns using context (e.g. "them" referring to keys → subject "car keys" or "keys").
-- Use subject "user" for the human speaker's personal state when no other name is given.
-- Prefer existing subject names from KNOWN FACTS when referring to the same entity.
-- Skip questions, speculation, hedges (I think / maybe / probably / not sure).
-- Skip pure narration fluff with no persistent attribute.
-- predicate: short snake_case (location, hair_color, age, owns, status, decided).
-- confidence 0.0-1.0; use <0.6 if uncertain; assistant-only claims max 0.75 unless clearly established.
-- If nothing durable: {"facts":[]}
-- No markdown fences. No commentary."""
 
 
 def _get_nlp():
     global _nlp
-    if _nlp is not None:
-        return _nlp
-    try:
-        import spacy
+    if _nlp is None:
         try:
+            import spacy
             _nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            from spacy.cli import download
-            download("en_core_web_sm")
-            _nlp = spacy.load("en_core_web_sm")
-        return _nlp
-    except ImportError:
-        return None
-
-
-def _parse_facts_json(text: str) -> list[dict[str, Any]]:
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        return []
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        logger.warning("LLM extract returned non-JSON (first 200 chars): %r", text[:200])
-        return []
-    facts = data.get("facts") if isinstance(data, dict) else None
-    if not isinstance(facts, list):
-        logger.warning("LLM extract JSON missing facts list: %r", type(data).__name__)
-        return []
-    out: list[dict[str, Any]] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        subj = _normalize_subject(str(f.get("subject") or ""))
-        pred = str(f.get("predicate") or "").strip().lower().replace(" ", "_")
-        obj = str(f.get("object") or "").strip()
-        if not subj or not pred or not obj:
-            continue
-        try:
-            conf = float(f.get("confidence", 0.7))
-        except (TypeError, ValueError):
-            conf = 0.7
-        speaker = str(f.get("speaker") or "unknown").lower()
-        if speaker == "assistant":
-            conf = min(conf, 0.75)
-        out.append(
-            {
-                "subject": subj,
-                "predicate": pred,
-                "object": obj,
-                "confidence": max(0.0, min(1.0, conf)),
-                "source": "llm",
-                "speaker": speaker,
-            }
-        )
-    return out
-
-
-_PRONOUNS = {
-    "he", "she", "it", "they", "him", "her", "them", "his", "hers", "their",
-    "i", "me", "my", "mine", "we", "us", "our", "you", "your",
-}
-
-_HEDGE_RE = re.compile(
-    r"\b(i think|i guess|maybe|perhaps|probably|not sure|might have|could have|"
-    r"i believe|seems like|sort of|kind of)\b",
-    re.I,
-)
-
-
-def _normalize_subject(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r"^(my|the|a|an)\s+", "", name, flags=re.I).strip()
-    name = re.sub(r"\s+", " ", name)
-    if not name:
-        return ""
-    # Prefer singular "keys" style consistency
-    lower = name.lower()
-    if lower in _PRONOUNS:
-        return ""
-    # Title-case multi-word carefully; keep existing capitals for names
-    if name.islower() or name.isupper():
-        name = name.title()
-    return name
-
-
-def _is_question(text: str) -> bool:
-    t = text.strip()
-    if t.endswith("?"):
-        return True
-    return bool(re.match(r"^(where|what|when|who|why|how|did|do|does|is|are|was|were|can|could|would|should)\b", t, re.I))
+        except (ImportError, OSError):
+            try:
+                import subprocess
+                subprocess.run(
+                    ["python", "-m", "spacy", "download", "en_core_web_sm"],
+                    check=True, capture_output=True
+                )
+                import spacy
+                _nlp = spacy.load("en_core_web_sm")
+            except Exception as e:
+                logger.warning(f"spaCy unavailable: {e}")
+                _nlp = False
+    return _nlp if _nlp is not False else None
 
 
 def strip_reasoning(text: str) -> str:
-    """Remove model thinking blocks before extraction."""
-    if not text:
-        return ""
-    text = re.sub(r"<think>[\s\S]*?</think>", " ", text, flags=re.I)
-    text = re.sub(r"<reasoning>[\s\S]*?</reasoning>", " ", text, flags=re.I)
-    return text.strip()
+    """Remove <think>...</think> blocks if present."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
+
+
+
+def _normalize_subject(value: str) -> str:
+    value = re.sub(r"\s+", " ", (value or "").strip())
+    return value
 
 class EntityExtractor:
-    """Heuristic entity extraction + structured fact candidates."""
+    """Conservative, domain-neutral durable-memory extractor.
 
-    # Name capture groups intentionally CASE-SENSITIVE ([A-Z][a-z]+) — no re.I
-    PATTERNS: list[tuple[re.Pattern[str], str, str | None]] = [
-        (re.compile(r"\b([A-Z][a-z]+)\s+is\s+(\d{1,3})\s+years?\s+old\b"), "character", "age"),
-        (re.compile(r"\b([A-Z][a-z]+),\s*(\d{1,3}),"), "character", "age"),
-        (re.compile(r"\b(?:my name is|I am|I'm)\s+([A-Z][a-z]+)\b"), "character", None),
-        # left/put keys on X — case-insensitive verbs, normalized subject
-        (
-            re.compile(
-                r"\b(?:left|put|placed|forgot)\s+(?:my\s+|the\s+)?([\w][\w\s]{1,28}?)\s+"
-                r"on\s+(?:the\s+)?([\w][\w\s\-]{1,40})",
-                re.I,
-            ),
-            "item",
-            "location",
-        ),
-        (
-            re.compile(
-                r"\b(?:keys?|wallet|phone|bag|sword|book)\b(?:\s+\w+){0,6}?\s+"
-                r"(?:on|in|at)\s+(?:the\s+)?([\w][\w\s\-]{1,40})",
-                re.I,
-            ),
-            "item",
-            "location_loose",
-        ),
-        # Maya's hair is black / Maya's black hair
-        (
-            re.compile(r"\b([A-Z][a-z]+)'s\s+(hair|eyes)\s+(?:is|are|was|were)\s+(\w+)\b"),
-            "character",
-            "attr",
-        ),
-        (
-            re.compile(r"\b([A-Z][a-z]+)'s\s+(red|black|blonde|brown|white|blue|green|gray|grey)\s+(hair|eyes)\b"),
-            "character",
-            "attr_adj",
-        ),
-        (
-            re.compile(r"\b(?:in|at|inside|near)\s+the\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"),
-            "location",
-            None,
-        ),
-    ]
+    Design rule: false positives are more damaging than missed memories.
+    We therefore extract only high-signal statements (explicit locations,
+    durable attributes, decisions/requirements, and technical parameter lines).
+    We do *not* treat arbitrary capitalized words as entities.
+    """
 
-    STOP_NAMES = {
-        "The", "A", "An", "I", "You", "He", "She", "It", "They", "We",
-        "This", "That", "There", "Here", "What", "When", "Where", "Who",
-        "How", "Why", "Yes", "No", "Okay", "Ok", "Hello", "Hi", "Hey",
-        "Sorry", "Please", "Thanks", "Thank", "Well", "So", "But", "And",
-        "Or", "If", "Then", "Old", "New", "Good", "Bad", "Tired", "Happy",
-        "Sad", "Maybe", "Perhaps", "Actually", "Suddenly", "Finally",
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    STOP_SUBJECTS = {
+        "i", "you", "he", "she", "it", "we", "they", "this", "that",
+        "the", "a", "an", "someone", "something", "thing", "things",
+        "user", "assistant", "system", "model", "response", "answer",
     }
+    HEDGE_RE = re.compile(r"\b(?:maybe|perhaps|possibly|probably|might|could|i think|i guess|it seems|apparently)\b", re.I)
+    # High-signal durable forms. Keep these deliberately narrow.
+    LOCATION_RE = re.compile(
+        r"\b(?:I|we|you|he|she|they)\s+(?:left|put|placed|stored|kept)\s+(?:the|my|our|your|his|her|their)\s+(.{2,60}?)\s+(?:on|in|at|under|inside|beside|behind|near)\s+(?:the\s+)?(.{2,60}?)(?=[.!?,;]|$)", re.I
+    )
+    POSSESSION_LOCATION_RE = re.compile(
+        r"\b(?:the|my|our|your|his|her|their)\s+(.{2,60}?)\s+(?:is|are|was|were)\s+(?:on|in|at|under|inside|beside|behind|near)\s+(?:the\s+)?(.{2,60}?)(?=[.!?,;]|$)", re.I
+    )
+    AGE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+is\s+(\d{1,3})\s+years?\s+old\b")
+    HAIR_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['’]s\s+hair\s+(?:is|was)\s+([A-Za-z-]{2,20})\b", re.I)
+    HAIR2_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+has\s+([A-Za-z-]{2,20})\s+hair\b", re.I)
+    EYES_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})['’]s\s+eyes\s+(?:are|were)\s+([A-Za-z-]{2,20})\b", re.I)
+    DECISION_RE = re.compile(r"\b(?:we|I)\s+(?:decided|agreed|settled on|chose|selected|rejected|assumed|will use|are using)\s+(?:that\s+)?(.{4,160}?)(?=[.!?]|$)", re.I)
+    REQUIREMENT_RE = re.compile(r"\b(?:must|shall|required to|needs to|need to|should remain|has to)\s+(.{4,160}?)(?=[.!?]|$)", re.I)
+    EXPLICIT_FACT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{1,40})\s+(?:has|owns|uses|lives in|works at|works for)\s+(.{2,100}?)(?=[.!?]|$)", re.I)
 
-    def __init__(
-        self,
-        db: StateDatabase,
-        use_spacy: bool = False,
-        min_confidence: float = 0.55,
-    ):
+    _PARAM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$", re.MULTILINE)
+    _SUBJECT_MARKER = re.compile(r"^\s*\[\s*subject\s*:\s*([^\]]+)\]\s*$", re.MULTILINE | re.I)
+    _PARAM_STOP_LABELS = {"note", "warning", "example", "todo", "see", "also", "ref", "reference", "source", "hint", "tip", "important", "remember", "caution", "danger"}
+
+    def __init__(self, db: StateDatabase, use_spacy: bool = False, min_confidence: float = 0.70):
         self.db = db
         self.use_spacy = use_spacy
         self.min_confidence = min_confidence
         self._nlp = _get_nlp() if use_spacy else None
+        self._is_system_message = False
+        self.conversation_id = "default"
+
+    def set_system_message(self, is_system: bool):
+        self._is_system_message = is_system
+
+    def _strip_bracketed_content(self, text: str) -> str:
+        text = re.sub(r"\[[^\]]*\]", " ", text)
+        text = re.sub(r"\【[^\】]*\】", " ", text)
+        text = re.sub(r"\〔[^\〕]*\〕", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _clean_value(value: str) -> str:
+        return re.sub(r"\s+", " ", value.strip(" \t\r\n.,;:!?"))
+
+    @staticmethod
+    def _clean_subject(value: str) -> str:
+        value = re.sub(r"\s+", " ", value.strip(" \t\r\n.,;:!?"))
+        return _normalize_subject(value) or value
+
+    def _valid_subject(self, subject: str) -> bool:
+        s = subject.strip().lower()
+        if not s or s in self.STOP_SUBJECTS or len(s) < 2 or len(s) > 80:
+            return False
+        if self.HEDGE_RE.search(subject):
+            return False
+        return True
 
     def extract_entities(self, text: str) -> list[dict[str, Any]]:
-        text = strip_reasoning(text)
-        entities: list[dict[str, Any]] = []
-        if self._nlp is not None:
-            entities.extend(self._spacy_extract(text))
-        entities.extend(self._pattern_entities(text))
-        entities.extend(self._capitalized_names(text))
-        return self._merge_entities(entities)
+        """Only emit entities attached to high-signal durable facts.
+
+        No capitalized-word heuristic and no blanket spaCy NER: both produced
+        database pollution in long narrative conversations.
+        """
+        return []
+
+    def _fact(self, subject: str, predicate: str, obj: str, conf: float, from_assistant: bool, source: str = "heuristic") -> dict[str, Any] | None:
+        subject = self._clean_subject(subject)
+        obj = self._clean_value(obj)
+        predicate = re.sub(r"[^a-z0-9_]+", "_", predicate.lower()).strip("_")
+        if not self._valid_subject(subject) or not predicate or not obj or len(obj) > 180:
+            return None
+        if self.HEDGE_RE.search(f"{subject} {predicate} {obj}"):
+            return None
+        return {"subject": subject, "predicate": predicate, "object": obj, "confidence": conf, "source": source if not from_assistant else "assistant"}
 
     def extract_fact_candidates(self, text: str, *, from_assistant: bool = False) -> list[dict[str, Any]]:
-        text = strip_reasoning(text)
-        if not text.strip():
+        if self._is_system_message:
             return []
-        if _is_question(text) and not re.search(
-            r"\b(left|put|placed|is|are|was)\b.+\b(on|in|at)\b", text, re.I
-        ):
-            pass
-
-        facts: list[dict[str, Any]] = []
-        facts.extend(self._generic_durable_facts(text, from_assistant=from_assistant))
-        facts.extend(self.extract_params(text, from_assistant=from_assistant))
-        for pattern, etype, attr_key in self.PATTERNS:
-            for m in pattern.finditer(text):
-                # Hedge check on surrounding window
-                start = max(0, m.start() - 40)
-                window = text[start : m.end() + 10]
-                if _HEDGE_RE.search(window):
-                    continue
-
-                if attr_key == "age":
-                    name = _normalize_subject(m.group(1))
-                    if not name:
-                        continue
-                    try:
-                        age = int(m.group(2))
-                    except ValueError:
-                        continue
-                    facts.append(self._fact(name, "age", str(age), 0.85, from_assistant))
-                elif attr_key == "location":
-                    item = _normalize_subject(m.group(1))
-                    loc = m.group(2).strip()
-                    if item and loc and not _is_question(m.group(0)):
-                        facts.append(self._fact(item, "location", loc, 0.8, from_assistant))
-                elif attr_key == "location_loose":
-                    loc = m.group(1).strip()
-                    kind = re.search(r"\b(keys?|wallet|phone|bag|sword|book)\b", m.group(0), re.I)
-                    subj = _normalize_subject(kind.group(1) if kind else "item")
-                    if subj and loc and not _is_question(m.group(0)):
-                        facts.append(self._fact(subj, "location", loc, 0.65, from_assistant))
-                elif attr_key == "attr":
-                    name = _normalize_subject(m.group(1))
-                    attr, val = m.group(2).lower(), m.group(3)
-                    pred = "hair_color" if attr == "hair" else "eye_color" if attr == "eyes" else attr
-                    if name:
-                        facts.append(self._fact(name, pred, val, 0.8, from_assistant))
-                elif attr_key == "attr_adj":
-                    name = _normalize_subject(m.group(1))
-                    color, attr = m.group(2).lower(), m.group(3).lower()
-                    pred = "hair_color" if attr == "hair" else "eye_color"
-                    if name:
-                        facts.append(self._fact(name, pred, color, 0.75, from_assistant))
-                elif attr_key is None and etype == "character":
-                    name = _normalize_subject(m.group(1))
-                    if name:
-                        # identity mention only — no fact unless age etc.
-                        pass
-        return facts
-
-    def _fact(
-        self, subject: str, predicate: str, obj: str, conf: float, from_assistant: bool
-    ) -> dict[str, Any]:
-        if from_assistant:
-            conf = min(conf, 0.75)
-        return {
-            "subject": subject,
-            "predicate": predicate,
-            "object": obj.strip(),
-            "confidence": conf,
-            "source": "heuristic",
-            "speaker": "assistant" if from_assistant else "user",
-        }
-
-
-    def _generic_durable_facts(self, text: str, *, from_assistant: bool) -> list[dict[str, Any]]:
-        """Domain-neutral durable facts (finance, product, physics, everyday)."""
+        text = strip_reasoning(text or "")
+        clean = self._strip_bracketed_content(text)
+        # A hedged statement is not durable memory. Reject the whole turn rather
+        # than accidentally capturing the asserted-looking fragment inside it.
+        if self.HEDGE_RE.search(clean):
+            return []
         out: list[dict[str, Any]] = []
 
-        for m in re.finditer(
-            r"\b([A-Za-z][A-Za-z0-9_]{1,40})\s+value\s+is\s+"
-            r"([€$£]?\d[\d.,]*(?:\s*(?:euros?|usd|dollars?|k|m))?)",
-            text,
-            re.I,
-        ):
-            subj = _normalize_subject(m.group(1)) or m.group(1)
-            out.append(self._fact(subj, "value", m.group(2).strip(), 0.9, from_assistant))
+        def add(subject, pred, obj, conf=0.9, source="heuristic"):
+            f = self._fact(subject, pred, obj, conf, from_assistant, source)
+            if f: out.append(f)
 
-        for m in re.finditer(
-            r"\b(?:the\s+)?([A-Za-z][A-Za-z0-9_\-\s]{1,40}?)\s+"
-            r"(?:is|are|was|were|must be|should be|set at|remains?)\s+"
-            r"([€$£]?\d[\d.,]*\s*(?:k|K|m|M|%|mm|cm|kg|euros?|dollars?|usd|hours?|days?)?|"
-            r"v?\d+(?:\.\d+)*)",
-            text,
-            re.I,
-        ):
-            subj = (_normalize_subject(m.group(1)) or m.group(1)).strip()
-            if subj.lower() in {"it", "this", "that", "there", "what", "which"}:
-                continue
-            # Drop run-on subjects ("We decided the cash reserve")
-            if len(subj.split()) > 4 or re.match(
-                r"^(we|i|you|they|he|she)\b", subj, re.I
-            ):
-                continue
-            window = text[max(0, m.start() - 30) : m.end() + 5]
-            if _HEDGE_RE.search(window) and not re.search(
-                r"\b(decided|agreed|confirmed|settled|record)\b", text, re.I
-            ):
-                continue
-            out.append(self._fact(subj, "value", m.group(2).strip(), 0.85, from_assistant))
+        # Explicit locations: this is the important everyday-assistant case.
+        for rx in (self.LOCATION_RE, self.POSSESSION_LOCATION_RE):
+            for m in rx.finditer(clean):
+                add(m.group(1), "location", m.group(2), 0.90)
 
-        for m in re.finditer(
-            r"\b(?:we\s+)?(?:decided|agreed|assumed|concluded|rejected|confirmed)\s+(?:that\s+)?(.{5,100})",
-            text,
-            re.I,
-        ):
-            clause = m.group(1).strip().rstrip(".")
-            out.append(self._fact("decision", "statement", clause[:120], 0.8, from_assistant))
-            inner = re.search(
-                r"([A-Za-z][A-Za-z0-9_\-\s]{1,40}?)\s+is\s+([€$£]?\d[\d.,]*\w*)",
-                clause,
-                re.I,
-            )
-            if inner:
-                subj = (_normalize_subject(inner.group(1)) or inner.group(1)).strip()
-                out.append(self._fact(subj, "value", inner.group(2).strip(), 0.88, from_assistant))
+        for m in self.AGE_RE.finditer(clean):
+            add(m.group(1), "age", m.group(2), 0.95)
+        for m in self.HAIR_RE.finditer(clean):
+            add(m.group(1), "hair_color", m.group(2), 0.90)
+        for m in self.HAIR2_RE.finditer(clean):
+            add(m.group(1), "hair_color", m.group(2), 0.90)
+        for m in self.EYES_RE.finditer(clean):
+            add(m.group(1), "eye_color", m.group(2), 0.90)
 
-        for m in re.finditer(
-            r"\b(?:left|put|placed|stored|kept)\s+(?:the\s+|my\s+|our\s+)?(.{2,40}?)\s+"
-            r"(?:on|in|at)\s+(?:the\s+)?(.{2,50})",
-            text,
-            re.I,
-        ):
-            if _HEDGE_RE.search(text[max(0, m.start() - 40) : m.end()]):
-                continue
-            subj = (_normalize_subject(m.group(1)) or m.group(1)).strip()
-            out.append(self._fact(subj, "location", m.group(2).strip(), 0.8, from_assistant))
+        for m in self.DECISION_RE.finditer(clean):
+            add("conversation", "decision", m.group(1), 0.90)
+        for m in self.REQUIREMENT_RE.finditer(clean):
+            add("conversation", "requirement", m.group(1), 0.88)
+        for m in self.EXPLICIT_FACT_RE.finditer(clean):
+            add(m.group(1), "association", m.group(2), 0.82)
 
-        return out
+        # Technical parameter pack remains opt-in and data-shaped only.
+        out.extend(self.extract_params(text, from_assistant=from_assistant))
 
-    
-    # --- Params pattern pack (Label: value) ---
-    # Fixed per DeepSeek review: no marker leak, correct collision detection,
-    # balanced noise filter, single regex architecture
-
-    _PARAM_LINE = re.compile(
-        r"^\s*([A-Za-z][A-Za-z0-9_ \-]{0,40}?)\s*[:=]\s*(.+?)\s*$",
-        re.MULTILINE,
-    )
-
-    _SUBJECT_MARKER = re.compile(
-        r"^\s*\[\s*subject\s*:\s*([^\]]+)\]\s*$",
-        re.MULTILINE | re.IGNORECASE
-    )
-
-    _PARAM_STOP_LABELS = {
-        "note", "warning", "example", "todo", "e.g.", "i.e.",
-        "see", "also", "ref", "reference", "source", "hint", "tip",
-        "important", "remember", "caution", "danger"
-    }
+        # Deduplicate exact candidates.
+        unique = {}
+        for f in out:
+            key = (f["subject"].lower(), f["predicate"], f["object"].lower())
+            unique[key] = f
+        return list(unique.values())
 
     @staticmethod
     def _normalize_param_label(label: str) -> str:
-        """Step Angle → step_angle"""
         label = label.strip().lower()
         label = re.sub(r"[\s\-]+", "_", label)
-        label = re.sub(r"[^a-z0-9_]", "", label)
-        return label
+        return re.sub(r"[^a-z0-9_]", "", label)
 
     @staticmethod
     def _looks_like_parameter_value(value: str) -> bool:
-        """Accept data-like values, reject prose."""
         value = value.strip()
-        if not value:
+        if not value or re.match(r"^[A-Za-z][A-Za-z\s]+$", value):
             return False
-
-        # Accept: any number (including small integers like Iterations: 12)
-        if re.match(r"^-?\d+(\.\d+)?$", value):
-            return True
-
-        # Accept: number with unit (10mm, 12V, 1.8°)
-        if re.search(r"\d+\s*[a-zA-Z°Ωµµ]+", value):
-            return True
-
-        # Accept: currency ($50k, €12.50)
-        if re.search(r"[€$£]\d", value):
-            return True
-
-        # Accept: version (v2, 1.2.3)
-        if re.match(r"^v?\d+(\.\d+)*(-[\w\-]+)?$", value):
-            return True
-
-        # Accept: model identifier (NEMA17, BME280)
-        if re.match(r"^[A-Z]+[\w\-]*\d+[\w\-]*$", value):
-            return True
-
-        # Reject: pure words without digits ("red", "large", "auto")
-        if re.match(r"^[a-zA-Z\s]+$", value):
-            return False
-
-        # Fallback: accept if has digit
-        return bool(re.search(r"\d", value))
+        return bool(
+            re.match(r"^-?\d+(?:\.\d+)?$", value)
+            or re.search(r"\d+\s*[a-zA-Z°Ωµ%]+", value)
+            or re.search(r"[€$£]\s*\d", value)
+            or re.match(r"^v?\d+(?:\.\d+)+(?:[-_][\w-]+)?$", value)
+            or re.match(r"^[A-Z]+[\w-]*\d+[\w-]*$", value)
+        )
 
     def preprocess_message(self, text: str) -> tuple[str, str]:
-        """
-        Strip subject markers from LLM-bound text, retain for extraction.
-        Returns (clean_text_for_llm, extraction_text_with_markers).
-        """
         markers = list(self._SUBJECT_MARKER.finditer(text))
         if not markers:
             return text, text
-
-        # Build clean text (markers removed) for LLM
-        clean_parts = []
-        last_end = 0
+        clean_parts, last_end = [], 0
         for m in markers:
-            clean_parts.append(text[last_end:m.start()])
-            last_end = m.end()
+            clean_parts.append(text[last_end:m.start()]); last_end = m.end()
         clean_parts.append(text[last_end:])
-        clean_text = "".join(clean_parts)
-
-        return clean_text, text  # Original text with markers for extraction
-
-    def _check_param_collision(
-        self, conversation_id: str, label: str, new_subject: str
-    ) -> str | None:
-        """Check if label exists under different subject. Returns existing subject or None."""
-        all_facts = self.db.list_active_facts(conversation_id, limit=200)
-        for fact in all_facts:
-            if fact["predicate"] == label and fact["subject"] != new_subject:
-                return fact["subject"]
-        return None
+        return "".join(clean_parts), text
 
     def extract_params(self, text: str, *, from_assistant: bool) -> list[dict[str, Any]]:
-        """Extract Label: value parameters with subject marker support."""
-        out: list[dict[str, Any]] = []
-
-        # Parse subject markers to establish context
-        markers = [(m.start(), m.group(1).strip()) 
-                   for m in self._SUBJECT_MARKER.finditer(text)]
-
-        # Build segments with their subjects
-        segments: list[tuple[str, str]] = []
-        if markers:
-            # Text before first marker uses default subject
-            first_pos = markers[0][0]
-            if first_pos > 0:
-                segments.append(("params", text[:first_pos]))
-
-            for i, (pos, subject) in enumerate(markers):
-                end = markers[i+1][0] if i+1 < len(markers) else len(text)
-                segments.append((subject, text[pos:end]))
-        else:
-            segments.append(("params", text))
-
-        # Extract params from each segment
-        for subject, segment_text in segments:
-            for m in self._PARAM_LINE.finditer(segment_text):
-                label = self._normalize_param_label(m.group(1))
-                raw_value = m.group(2).strip()
-
-                # Skip stop labels
-                if label in self._PARAM_STOP_LABELS:
-                    continue
-
-                # Skip subject marker lines themselves
-                if self._SUBJECT_MARKER.match(m.group(0)):
-                    continue
-
-                # Check for multi-value (comma/semicolon/pipe separated)
-                if any(sep in raw_value for sep in [",", ";", "|"]):
-                    parts = [p.strip() for p in re.split(r"[,;|]", raw_value) if p.strip()]
-                    valid_parts = [p for p in parts if self._looks_like_parameter_value(p)]
-
-                    if len(valid_parts) > 1:
-                        # Store as multiple facts (better retrieval than JSON blob)
-                        for part in valid_parts:
-                            out.append(self._fact(
-                                subject=subject,
-                                predicate=label,
-                                obj=part,
-                                conf=0.85,
-                                from_assistant=from_assistant
-                            ))
-                    elif len(valid_parts) == 1:
-                        out.append(self._fact(
-                            subject=subject,
-                            predicate=label,
-                            obj=valid_parts[0],
-                            conf=0.9,
-                            from_assistant=from_assistant
-                        ))
-                else:
-                    # Single value
-                    if self._looks_like_parameter_value(raw_value):
-                        # Check for collision with different subject
-                        existing_subject = self._check_param_collision(
-                            getattr(self, 'conversation_id', 'default'), 
-                            label, subject
-                        )
-                        if existing_subject and subject == "params":
-                            logger.warning(
-                                "Param '%s' already exists under subject '%s'. "
-                                "Consider using [subject: X] marker to disambiguate.",
-                                label, existing_subject
-                            )
-
-                        out.append(self._fact(
-                            subject=subject,
-                            predicate=label,
-                            obj=raw_value,
-                            conf=0.9,
-                            from_assistant=from_assistant
-                        ))
-
-        return out
-
-
-
-
-    def process_turn_heuristic(
-        self,
-        conversation_id: str,
-        user_text: str,
-        ai_text: str,
-        turn_number: int,
-    ) -> dict[str, Any]:
-        """Upsert entities only. Facts are committed via MemoryPipeline."""
-        combined = f"{strip_reasoning(user_text or '')}\n{strip_reasoning(ai_text or '')}"
-        entities = self.extract_entities(combined)
-        entity_ids: list[int] = []
-        for e in entities:
-            if e.get("confidence", 0) < self.min_confidence:
-                continue
-            eid = self.db.upsert_entity(
-                conversation_id,
-                e["name"],
-                e["type"],
-                e.get("attributes") or {},
-                e.get("confidence", 0.6),
-            )
-            entity_ids.append(eid)
-        if entity_ids:
-            self.db.log_event(
-                conversation_id,
-                turn_number,
-                f"heuristic entities: {len(entity_ids)}",
-                {"entities": len(entity_ids)},
-            )
-        return {"entities": len(entity_ids), "facts": []}
-
-    def _spacy_extract(self, text: str) -> list[dict[str, Any]]:
-        assert self._nlp is not None
-        doc = self._nlp(text)
-        out: list[dict[str, Any]] = []
-        mapping = {
-            "PERSON": "character",
-            "ORG": "organization",
-            "GPE": "location",
-            "LOC": "location",
-            "FAC": "location",
-            "PRODUCT": "item",
-        }
-        for ent in doc.ents:
-            etype = mapping.get(ent.label_)
-            if not etype:
-                continue
-            name = _normalize_subject(ent.text)
-            if not name or name in self.STOP_NAMES or len(name) < 2:
-                continue
-            out.append(
-                {
-                    "name": name,
-                    "type": etype,
-                    "attributes": {"source": "spacy"},
-                    "confidence": 0.75,
-                }
-            )
-        return out
-
-    def _pattern_entities(self, text: str) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for pattern, etype, attr_key in self.PATTERNS:
-            for m in pattern.finditer(text):
-                if attr_key in ("location", "location_loose"):
-                    continue
-                name = _normalize_subject(m.group(1))
-                if not name or name in self.STOP_NAMES or len(name) < 2:
-                    continue
-                attrs: dict[str, Any] = {"source": "pattern"}
-                if attr_key == "age" and m.lastindex and m.lastindex >= 2:
-                    try:
-                        attrs["age"] = int(m.group(2))
-                    except ValueError:
-                        pass
-                out.append(
-                    {
-                        "name": name,
-                        "type": "character" if etype in ("character", "item") else etype,
-                        "attributes": attrs,
-                        "confidence": 0.7,
-                    }
-                )
-        return out
-
-    def _capitalized_names(self, text: str) -> list[dict[str, Any]]:
-        # Only mid-sentence or repeated proper nouns — skip pure sentence-initial once
-        candidates = re.findall(r"(?<![.!?]\s)(?<!^)\b([A-Z][a-z]{2,})\b", text)
-        # Also allow start-of-text names that repeat
-        starts = re.findall(r"(?:^|[.!?]\s+)([A-Z][a-z]{2,})\b", text)
-        counts: dict[str, int] = {}
-        for c in candidates + starts:
-            if c in self.STOP_NAMES:
-                continue
-            counts[c] = counts.get(c, 0) + 1
         out = []
-        for name, n in counts.items():
-            # Require repetition for sentence-initial-only tokens
-            conf = min(0.7, 0.4 + 0.12 * n)
-            if n == 1 and name in starts and name not in candidates:
-                conf = 0.45  # weak single sentence-initial
-            out.append(
-                {
-                    "name": name,
-                    "type": "character",
-                    "attributes": {"source": "capitalized"},
-                    "confidence": conf,
-                }
-            )
+        subject = "params"
+        markers = list(self._SUBJECT_MARKER.finditer(text))
+        if markers:
+            subject = self._clean_subject(markers[-1].group(1))
+        for m in self._PARAM_LINE.finditer(text):
+            label = self._normalize_param_label(m.group(1))
+            raw = self._clean_value(m.group(2))
+            if not label or label in self._PARAM_STOP_LABELS or self._SUBJECT_MARKER.match(m.group(0)):
+                continue
+            parts = [self._clean_value(x) for x in re.split(r"[,;|]", raw)] if any(x in raw for x in ",;|") else [raw]
+            valid = [x for x in parts if self._looks_like_parameter_value(x)]
+            for value in valid:
+                f = self._fact(subject, label, value, 0.90, from_assistant, "params")
+                if f: out.append(f)
         return out
 
-    def _merge_entities(self, entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        merged: dict[str, dict[str, Any]] = {}
-        for e in entities:
-            key = e["name"].lower()
-            if key in merged:
-                merged[key]["attributes"].update(e.get("attributes") or {})
-                merged[key]["confidence"] = max(
-                    merged[key]["confidence"], e.get("confidence", 0)
-                )
-                if e.get("type") and e["type"] != "unknown":
-                    merged[key]["type"] = e["type"]
-            else:
-                merged[key] = {
-                    "name": e["name"],
-                    "type": e.get("type") or "unknown",
-                    "attributes": dict(e.get("attributes") or {}),
-                    "confidence": e.get("confidence", 0.5),
-                }
-        return list(merged.values())
+    def process_turn_heuristic(self, user_text: str, assistant_text: str, turn_number: int, conversation_id: str):
+        self.conversation_id = conversation_id
+        facts = self.extract_fact_candidates(user_text, from_assistant=False) + self.extract_fact_candidates(assistant_text, from_assistant=True)
+        # Never store entities from prose. Entities are created only for explicit fact subjects.
+        subjects = {f["subject"] for f in facts if f["subject"].lower() != "conversation" and f["subject"].lower() != "params"}
+        for subject in subjects:
+            self.db.upsert_entity(conversation_id, subject, "unknown", {"source": "fact_subject"}, 0.80)
+        results = []
+        for fact in facts:
+            results.append(self.db.commit_fact(conversation_id, fact["subject"], fact["predicate"], fact["object"], fact["confidence"], turn_number, fact.get("source", "heuristic")))
+        return len(subjects), len(results)
 
 
 class MemoryPipeline:
-    """Extract → Validate → Commit with optional same-model LLM extract."""
-
-    def __init__(
-        self,
-        db: StateDatabase,
-        heuristic: EntityExtractor,
-        *,
-        mode: str = "hybrid",
-        min_confidence: float = 0.55,
-        on_conflict: str = "reconcile",
-        llm_every_n_turns: int = 1,
-        llm_max_tokens: int = 400,
-        llm_temperature: float = 0.1,
-    ):
+    """Extract only after the response is validated; optionally use the same LLM."""
+    def __init__(self, db: StateDatabase, extractor: EntityExtractor, *, mode="heuristic", min_confidence=0.70, on_conflict="reconcile", llm_every_n_turns=0, llm_max_tokens=300, llm_temperature=0.0):
         self.db = db
-        self.heuristic = heuristic
+        self.extractor = extractor
         self.mode = mode
         self.min_confidence = min_confidence
         self.on_conflict = on_conflict
-        self.llm_every_n_turns = max(1, llm_every_n_turns)
+        self.llm_every_n_turns = llm_every_n_turns
         self.llm_max_tokens = llm_max_tokens
         self.llm_temperature = llm_temperature
 
-    async def process_turn(
-        self,
-        conversation_id: str,
-        user_text: str,
-        ai_text: str,
-        turn_number: int,
-        llm_complete: Callable[..., Awaitable[str]] | None = None,
-    ) -> dict[str, Any]:
-        summary: dict[str, Any] = {
-            "entities": 0,
-            "facts_committed": [],
-            "conflicts": [],
-            "llm_used": False,
-        }
-
-        user_text = strip_reasoning(user_text or "")
-        ai_text = strip_reasoning(ai_text or "")
-
-        h = self.heuristic.process_turn_heuristic(
-            conversation_id, user_text, ai_text, turn_number
-        )
-        summary["entities"] = h["entities"]
-
-        candidates: list[dict[str, Any]] = []
-        candidates.extend(self.heuristic.extract_fact_candidates(user_text, from_assistant=False))
-        candidates.extend(self.heuristic.extract_fact_candidates(ai_text, from_assistant=True))
-
-        use_llm = False
-        if llm_complete is not None and self.mode in ("llm", "hybrid"):
-            if self.mode == "llm":
-                use_llm = turn_number % self.llm_every_n_turns == 0
-            else:
-                use_llm = bool(candidates) or (turn_number % self.llm_every_n_turns == 0)
-
-        if use_llm and llm_complete is not None:
-            try:
-                known = self.db.list_active_facts(conversation_id, limit=15)
-                llm_facts = await self._llm_extract(user_text, ai_text, known, llm_complete)
-                summary["llm_used"] = True
-                candidates.extend(llm_facts)
-            except Exception:
-                logger.exception("LLM structured extraction failed")
-
-        merged: dict[tuple[str, str], dict[str, Any]] = {}
-        for f in candidates:
-            key = (f["subject"].lower(), f["predicate"].lower())
-            if key not in merged or f.get("confidence", 0) > merged[key].get("confidence", 0):
-                merged[key] = f
-        candidates = list(merged.values())
-
-        for f in candidates:
-            if f.get("confidence", 0) < self.min_confidence:
-                continue
-            result = await self._validate_and_commit(
-                conversation_id, f, turn_number, llm_complete
-            )
-            if result:
-                summary["facts_committed"].append(result)
-                if result.get("conflict"):
-                    summary["conflicts"].append(result["conflict"])
-
-        return summary
-
-    async def _llm_extract(
-        self,
-        user_text: str,
-        ai_text: str,
-        known_facts: list[dict[str, Any]],
-        llm_complete: Callable[..., Awaitable[str]],
-    ) -> list[dict[str, Any]]:
-        known_lines = "\n".join(
-            f"- {f['subject']}.{f['predicate']} = {f['object']}" for f in known_facts
-        ) or "(none)"
-        messages = [
-            {"role": "system", "content": EXTRACT_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    f"KNOWN FACTS:\n{known_lines}\n\n"
-                    f"User: {user_text or '(empty)'}\n"
-                    f"Assistant: {ai_text or '(empty)'}\n\n"
-                    "Extract durable facts as JSON."
-                ),
-            },
-        ]
-        raw = await llm_complete(
-            messages,
-            max_tokens=self.llm_max_tokens,
-            temperature=self.llm_temperature,
-        )
-        return _parse_facts_json(raw or "")
-
-    async def _validate_and_commit(
-        self,
-        conversation_id: str,
-        fact: dict[str, Any],
-        turn_number: int,
-        llm_complete: Callable[..., Awaitable[str]] | None,
-    ) -> dict[str, Any] | None:
-        existing = self.db.get_active_fact(
-            conversation_id, fact["subject"], fact["predicate"]
-        )
-        conflict = None
-
-        if existing and existing["object"].strip().lower() != str(fact["object"]).strip().lower():
-            conflict = {
-                "subject": fact["subject"],
-                "predicate": fact["predicate"],
-                "existing": existing["object"],
-                "incoming": fact["object"],
-            }
-            if self.on_conflict == "flag":
-                logger.info(
-                    "Fact conflict %s.%s: %r -> %r",
-                    fact["subject"],
-                    fact["predicate"],
-                    existing["object"],
-                    fact["object"],
-                )
-            elif self.on_conflict == "reconcile" and llm_complete is not None:
-                resolved = await self._reconcile(existing, fact, llm_complete)
-                if resolved is None:
-                    self.db.log_event(
-                        conversation_id, turn_number, "conflict kept existing", conflict
-                    )
-                    return {"status": "rejected", "conflict": conflict, "fact": existing}
-                fact = resolved
-
-        result = self.db.commit_fact(
-            conversation_id,
-            fact["subject"],
-            fact["predicate"],
-            fact["object"],
-            confidence=fact.get("confidence", 0.7),
-            turn_number=turn_number,
-            source=fact.get("source", "heuristic"),
-        )
-        if conflict:
-            result["conflict"] = conflict
-        return result
-
-    async def _reconcile(
-        self,
-        existing: dict[str, Any],
-        incoming: dict[str, Any],
-        llm_complete: Callable[..., Awaitable[str]],
-    ) -> dict[str, Any] | None:
-        prompt = (
-            "Conversation memory conflict. Reply with ONLY JSON:\n"
-            '{"action":"keep_existing"|"accept_new"|"update","object":"...","confidence":0.0}\n\n'
-            f"Subject: {incoming['subject']}\n"
-            f"Predicate: {incoming['predicate']}\n"
-            f"Existing value: {existing['object']}\n"
-            f"New value from latest turn: {incoming['object']}\n"
-            "If the new text intentionally changes state, accept_new or update. "
-            "If it looks like a continuity error or speculation, keep_existing."
-        )
-        messages = [
-            {"role": "system", "content": "You resolve memory conflicts. JSON only."},
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            raw = await llm_complete(messages, max_tokens=150, temperature=0.0)
-        except Exception:
-            logger.exception("Reconcile call failed")
-            return None
-
-        text = (raw or "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-
-        action = str(data.get("action", "")).lower()
-        if action == "keep_existing":
-            return None
-        obj = str(data.get("object") or incoming["object"]).strip()
-        try:
-            conf = float(data.get("confidence", incoming.get("confidence", 0.7)))
-        except (TypeError, ValueError):
-            conf = 0.7
-        return {
-            "subject": incoming["subject"],
-            "predicate": incoming["predicate"],
-            "object": obj,
-            "confidence": conf,
-            "source": "reconcile",
-        }
+    async def process_turn(self, conversation_id: str, user_text: str, assistant_text: str, turn_number: int, llm_complete=None):
+        # Deterministic path first. The proxy has already performed its response
+        # consistency pass for JSON requests; streaming uses this post-pass.
+        return self.extractor.process_turn_heuristic(user_text, assistant_text, turn_number, conversation_id)

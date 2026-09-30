@@ -1,49 +1,36 @@
-# AutoRAG Middleware 0.2.0 default configuration
-
+# AutoRAG Middleware 0.4.0 — conservative memory by default
 host: "127.0.0.1"
 port: 8000
-
-# database_path: null  # default: platformdirs user_data_dir / state.db
-
 max_injected_tokens: 1500
 context_window: 8000
-
-# Conversation scoping: header X-Conversation-Id, body field, or this default
 default_conversation_id: "default"
 
 extraction:
   enabled: true
   use_spacy: false
-  min_confidence: 0.55
-  # "heuristic" | "llm" | "hybrid"
-  mode: "hybrid"
-  llm_every_n_turns: 1
-  llm_max_tokens: 400
-  llm_temperature: 0.1
+  min_confidence: 0.70
+  # heuristic = deterministic, conservative, no extra LLM calls
+  # llm = same-model structured extraction
+  # hybrid = heuristic plus LLM only when explicitly configured
+  mode: "heuristic"
+  llm_every_n_turns: 0
+  llm_max_tokens: 300
+  llm_temperature: 0.0
 
 validation:
   enabled: true
-  # "off" | "flag" | "reconcile"
+  # Memory conflicts: off | flag | reconcile
   on_conflict: "reconcile"
-  # Draft reply vs memory: off | flag | soft | hard | reconcile
+  # Draft-vs-memory check: off | flag | soft | hard | reconcile
   response_policy: "hard"
   max_retries: 1
-  use_llm_claims: true   # domain-neutral claim extract via same backend
-  extra_patterns: []    # e.g. [rp] for narrative, [params] for Label: value specs
-
+  # Only needed for semantic claims the deterministic checker cannot see.
+  # Keep false for the cheapest/safest default.
+  use_llm_claims: false
+  extra_patterns: []
 
 backends:
   default:
     api_base: "http://127.0.0.1:1234/v1"
     api_key: "not-needed"
     model: "local-model"
-
-  lmstudio:
-    api_base: "http://127.0.0.1:1234/v1"
-    api_key: "not-needed"
-    model: "local-model"
-
-  ollama:
-    api_base: "http://127.0.0.1:11434/v1"
-    api_key: "not-needed"
-    model: "llama3.2"

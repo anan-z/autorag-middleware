@@ -544,6 +544,39 @@ class StateDatabase:
                 (conversation_id, turn_number, description, json.dumps(payload or {}), _now()),
             )
 
+    def purge_conversation(self, conversation_id: str, *, delete_conversation: bool = True) -> dict[str, int]:
+        """Delete all persisted state for exactly one conversation.
+
+        Also removes vector rows and conversation metadata. This is intentionally
+        explicit rather than a generic "clear DB" operation.
+        """
+        tables = ["entities", "facts", "events", "relationships", "conversation_state"]
+        deleted: dict[str, int] = {}
+        with self._connect() as conn:
+            # fact_vectors has no conversation_id; remove vectors through fact ids.
+            fact_rows = conn.execute("SELECT id FROM facts WHERE conversation_id = ?", (conversation_id,)).fetchall()
+            fact_ids = [int(r["id"]) for r in fact_rows]
+            if fact_ids:
+                placeholders = ",".join("?" * len(fact_ids))
+                try:
+                    cur = conn.execute(f"DELETE FROM fact_vectors WHERE fact_id IN ({placeholders})", fact_ids)
+                    deleted["fact_vectors"] = int(cur.rowcount or 0)
+                except sqlite3.OperationalError:
+                    deleted["fact_vectors"] = 0
+            else:
+                deleted["fact_vectors"] = 0
+            for table in tables:
+                try:
+                    cur = conn.execute(f"DELETE FROM {table} WHERE conversation_id = ?", (conversation_id,))
+                    deleted[table] = int(cur.rowcount or 0)
+                except sqlite3.OperationalError:
+                    # Older/current schemas may not have optional tables.
+                    deleted[table] = 0
+            if delete_conversation:
+                cur = conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+                deleted["conversations"] = int(cur.rowcount or 0)
+        return deleted
+
     def entity_count(self, conversation_id: str | None = None) -> int:
         with self._connect() as conn:
             if conversation_id:

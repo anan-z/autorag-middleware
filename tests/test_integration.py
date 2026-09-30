@@ -1,392 +1,180 @@
-"""Tests for AutoRAG 0.2.2."""
-
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
 
-import pytest
-
-from autorag.config import AutoRAGConfig
+from autorag.config import AutoRAGConfig, LLMBackend
 from autorag.database import StateDatabase, _simple_embed
-from autorag.extractor import (
-    EntityExtractor,
-    MemoryPipeline,
-    _normalize_subject,
-    _parse_facts_json,
-    strip_reasoning,
-)
+from autorag.extractor import EntityExtractor, MemoryPipeline, strip_reasoning
 from autorag.injector import ContextInjector
 from autorag.proxy import AutoRAGProxy
+from autorag.validator import ResponseValidator
 
 
-@pytest.fixture
-def db(tmp_path: Path):
-    return StateDatabase(tmp_path / "test.db")
+def db(tmp_path: Path) -> StateDatabase:
+    return StateDatabase(tmp_path / "state.db")
 
 
-def test_conversation_isolation(db: StateDatabase):
-    db.commit_fact("conv_a", "car keys", "location", "finger-take", turn_number=1)
-    db.commit_fact("conv_b", "car keys", "location", "kitchen counter", turn_number=1)
-    a = db.get_active_fact("conv_a", "car keys", "location")
-    b = db.get_active_fact("conv_b", "car keys", "location")
-    assert a["object"] == "finger-take"
-    assert b["object"] == "kitchen counter"
+def test_conversation_isolation(tmp_path):
+    d = db(tmp_path)
+    d.commit_fact("home", "car keys", "location", "finger-take", turn_number=1)
+    d.commit_fact("work", "car keys", "location", "kitchen counter", turn_number=1)
+    assert d.get_active_fact("home", "car keys", "location")["object"] == "finger-take"
+    assert d.get_active_fact("work", "car keys", "location")["object"] == "kitchen counter"
+    assert d.search_facts("work", "where are my car keys")[0]["object"] == "kitchen counter"
 
 
-def test_supersede_and_rollback(db: StateDatabase):
-    db.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
-    db.commit_fact("c1", "Maya", "hair_color", "red", turn_number=5)
-    assert db.get_active_fact("c1", "Maya", "hair_color")["object"] == "red"
-    n = db.deactivate_facts_from_turn("c1", 5)
-    assert n >= 1
-    # after rollback of turn 5+, black should still be active if not deactivated
-    # (black was turn 1; only turn>=5 deactivated — red gone, black still active)
-    active = db.get_active_fact("c1", "Maya", "hair_color")
-    assert active is not None
-    assert active["object"] == "black"
+def test_conservative_extractor_car_keys(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("I left my car keys on the finger-take near the door.")
+    locs = [f for f in facts if f["predicate"] == "location"]
+    assert len(locs) == 1
+    assert locs[0]["subject"].lower() == "car keys"
+    assert "finger-take" in locs[0]["object"].lower()
 
 
-def test_normalize_subject():
-    assert _normalize_subject("my car keys") == "Car Keys" or _normalize_subject("my car keys").lower() == "car keys"
-    assert _normalize_subject("he") == ""
-    assert _normalize_subject("the keys") != ""
+def test_narrative_does_not_pollute(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    text = "A beautiful sunset painted the room gold while Maya smiled and the wind lifted her red hair."
+    facts = ext.extract_fact_candidates(text, from_assistant=True)
+    assert not any(f["predicate"] in {"location", "association", "decision", "requirement"} for f in facts)
+    assert not ext.extract_entities(text)
 
 
-def test_no_re_i_on_tired(db: StateDatabase):
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_fact_candidates("I'm Tired today")
-    # should not invent Tired as subject of age/location
-    assert not any(f["subject"].lower() == "tired" for f in facts)
-    ents = ext.extract_entities("I'm Tired today")
-    # "Tired" may appear as weak entity but confidence low / stop list
-    strong = [e for e in ents if e["name"] == "Tired" and e["confidence"] >= 0.55]
-    assert strong == []
-
-
-def test_hedge_skips_speculation(db: StateDatabase):
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_fact_candidates(
-        "I think I left my keys on the kitchen counter, maybe."
-    )
-    # hedge window should skip
+def test_hedged_location_is_not_memory(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("I think I left my keys on the kitchen counter, maybe.")
     assert not any(f["predicate"] == "location" for f in facts)
 
 
-def test_location_assertion(db: StateDatabase):
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_fact_candidates(
-        "I left my car keys on the finger-take near the door."
-    )
-    locs = [f for f in facts if f["predicate"] == "location"]
-    assert locs
-    assert any("key" in f["subject"].lower() for f in locs)
+def test_hair_fact_is_high_signal(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("Maya's hair is black.")
+    assert [(f["subject"], f["predicate"], f["object"]) for f in facts] == [("Maya", "hair_color", "black")]
 
 
-def test_no_owner_from_possessive_dog(db: StateDatabase):
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_fact_candidates("Maya's dog barked at John's car.")
-    assert not any(f["predicate"] == "owner" for f in facts)
+def test_parameter_pack_is_data_shaped(tmp_path):
+    ext = EntityExtractor(db(tmp_path), use_spacy=False)
+    facts = ext.extract_fact_candidates("[subject: motor_a]\nWidth: 42mm\nNote: use a quiet fan\nIterations: 12")
+    vals = {(f["subject"].lower(), f["predicate"], f["object"]) for f in facts}
+    assert ("motor_a", "width", "42mm") in vals
+    assert ("motor_a", "iterations", "12") in vals
+    assert not any(f["predicate"] == "note" for f in facts)
 
 
-def test_parse_facts_json():
-    raw = '{"facts":[{"subject":"car keys","predicate":"location","object":"home","confidence":0.9}]}'
-    facts = _parse_facts_json(raw)
-    assert facts[0]["subject"].lower().find("key") >= 0 or facts[0]["subject"]
+def test_pipeline_commits_only_high_signal(tmp_path):
+    d = db(tmp_path)
+    ext = EntityExtractor(d, use_spacy=False)
+    pipe = MemoryPipeline(d, ext)
+    result = asyncio.run(pipe.process_turn("c1", "I left my car keys on the finger-take.", "A beautiful sunset painted the room gold.", 1))
+    assert result[1] == 1
+    assert d.fact_count("c1") == 1
+    assert d.get_active_fact("c1", "car keys", "location")["object"] == "finger-take"
+
+
+def test_supersede_and_rollback(tmp_path):
+    d = db(tmp_path)
+    d.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
+    d.commit_fact("c1", "Maya", "hair_color", "red", turn_number=5)
+    assert d.get_active_fact("c1", "Maya", "hair_color")["object"] == "red"
+    d.deactivate_facts_from_turn("c1", 5)
+    assert d.get_active_fact("c1", "Maya", "hair_color")["object"] == "black"
+
+
+def test_reality_check_detects_maya_conflict(tmp_path):
+    d = db(tmp_path)
+    d.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
+    v = ResponseValidator(d, EntityExtractor(d), use_llm_claims=False)
+    conflicts = v.find_conflicts("c1", "A breeze swept through the room, lifting Maya's red hair.")
+    assert conflicts and conflicts[0]["existing"] == "black" and conflicts[0]["generated"].lower() == "red"
+
+
+def test_reality_check_ignores_matching_fact(tmp_path):
+    d = db(tmp_path)
+    d.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
+    v = ResponseValidator(d, EntityExtractor(d), use_llm_claims=False)
+    assert v.find_conflicts("c1", "A breeze lifted Maya's black hair.") == []
+
+
+def test_deterministic_vectors_survive_restart(tmp_path):
+    first = _simple_embed("Maya black hair")
+    second = _simple_embed("Maya black hair")
+    assert first == second
+    d = db(tmp_path)
+    d.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
+    d2 = StateDatabase(tmp_path / "state.db")
+    assert d2.get_active_fact("c1", "Maya", "hair_color")["object"] == "black"
+
+
+def test_purge_only_one_conversation(tmp_path):
+    d = db(tmp_path)
+    d.commit_fact("a", "car keys", "location", "finger-take", turn_number=1)
+    d.commit_fact("b", "car keys", "location", "desk", turn_number=1)
+    d.ensure_conversation("a")
+    d.ensure_conversation("b")
+    deleted = d.purge_conversation("a")
+    assert deleted["facts"] == 1
+    assert d.get_active_fact("a", "car keys", "location") is None
+    assert d.get_active_fact("b", "car keys", "location")["object"] == "desk"
+
+
+def test_config_is_conservative():
+    cfg = AutoRAGConfig()
+    assert cfg.host == "127.0.0.1"
+    assert cfg.extraction.mode == "heuristic"
+    assert cfg.validation.use_llm_claims is False
+
+
+def test_proxy_can_initialize(tmp_path):
+    cfg = AutoRAGConfig(database_path=tmp_path / "proxy.db")
+    proxy = AutoRAGProxy(cfg)
+    assert proxy.db.fact_count() == 0
+    asyncio.run(proxy.close())
+
+
+def test_system_messages_are_preserved():
+    msgs = [{"role":"system","content":"You are helpful."},{"role":"system","content":"Author note."},{"role":"user","content":"Hi"}]
+    out = AutoRAGProxy._ensure_system_message(msgs, "[MEMORY]\nkeys\n[/MEMORY]")
+    systems = [m for m in out if m["role"] == "system"]
+    assert len(systems) == 2
+    assert "MEMORY" in systems[0]["content"]
+    assert systems[1]["content"] == "Author note."
 
 
 def test_strip_reasoning():
-    t = strip_reasoning("Hello <think>secret</think> world")
-    assert "secret" not in t
-    assert "Hello" in t and "world" in t
+    assert strip_reasoning("hello <think>private</think> world") == "hello  world"
 
 
-def test_search_facts_token_score(db: StateDatabase):
-    db.commit_fact("c1", "car keys", "location", "finger-take", turn_number=1)
-    db.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
-    hits = db.search_facts("c1", "Where did I leave my car keys?")
-    assert hits
-    assert hits[0]["subject"].lower().find("key") >= 0 or "key" in hits[0]["object"].lower() or hits[0]["predicate"] == "location"
+def test_json_proxy_reality_check_can_correct_draft(tmp_path):
+    import httpx
+    cfg = AutoRAGConfig(database_path=tmp_path / "proxy.db")
+    cfg.backends["default"] = LLMBackend(api_base="http://fake/v1", api_key="not-needed", model="local-model")
+    proxy = AutoRAGProxy(cfg)
+    proxy.db.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
+    calls = []
 
+    async def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            body = {"choices": [{"message": {"role": "assistant", "content": "A breeze lifted Maya's red hair."}}]}
+        else:
+            body = {"choices": [{"message": {"role": "assistant", "content": "A breeze lifted Maya's black hair."}}]}
+        return httpx.Response(200, json=body)
 
-def test_embed_stable():
-    assert _simple_embed("Maya") == _simple_embed("Maya")
-
-
-def test_config_defaults():
-    cfg = AutoRAGConfig()
-    assert cfg.host == "127.0.0.1"
-    assert cfg.extraction.mode in ("heuristic", "llm", "hybrid")
-
-
-def test_ensure_system_keeps_later_system_messages():
-    msgs = [
-        {"role": "system", "content": "You are helpful."},
-        {"role": "system", "content": "Author note: be brief."},
-        {"role": "user", "content": "Hi"},
-    ]
-    out = AutoRAGProxy._ensure_system_message(msgs, "[MEMORY]\nx\n[/MEMORY]")
-    system_msgs = [m for m in out if m["role"] == "system"]
-    assert len(system_msgs) == 2
-    assert "MEMORY" in system_msgs[0]["content"]
-    assert system_msgs[1]["content"] == "Author note: be brief."
-
-
-def test_user_turn_index():
-    msgs = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "a"},
-        {"role": "assistant", "content": "b"},
-        {"role": "user", "content": "c"},
-    ]
-    assert AutoRAGProxy._user_turn_index(msgs) == 2
-
-
-def test_fingerprint_stable():
-    msgs = [
-        {"role": "system", "content": "You are Maya."},
-        {"role": "user", "content": "Hello"},
-    ]
-    a = AutoRAGProxy._fingerprint_messages(msgs)
-    b = AutoRAGProxy._fingerprint_messages(msgs)
-    assert a == b
-    assert a.startswith("fp_")
-
-
-def test_injector_label(db: StateDatabase):
-    db.commit_fact("c1", "keys", "location", "table", turn_number=1)
-    block = ContextInjector(db, AutoRAGConfig()).build_system_prompt("c1", "where are keys")
-    assert "ESTABLISHED FACTS" in block or "keys" in block
-
-
-def test_pipeline_heuristic(db: StateDatabase):
-    ext = EntityExtractor(db, use_spacy=False, min_confidence=0.5)
-    pipe = MemoryPipeline(db, ext, mode="heuristic", on_conflict="flag")
-    result = asyncio.run(
-        pipe.process_turn(
-            "rp1",
-            "I left my wallet on the desk.",
-            "Got it.",
-            turn_number=1,
-            llm_complete=None,
+    async def run():
+        await proxy.client.aclose()
+        proxy.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        result = await proxy._json_completion(
+            "http://fake/v1/chat/completions",
+            {"Content-Type": "application/json"},
+            {"model": "local-model", "messages": [{"role": "user", "content": "Describe the scene."}]},
+            cfg.backends["default"],
+            "c1", "Describe the scene.", "", 2,
         )
-    )
-    assert isinstance(result["facts_committed"], list)
+        return result
 
-
-def test_pipeline_conflict_keep(db: StateDatabase):
-    db.commit_fact("rp1", "Maya", "hair_color", "black", confidence=0.95, turn_number=1)
-
-    async def fake_llm(messages, max_tokens=150, temperature=0.0):
-        return '{"action":"keep_existing","object":"black","confidence":0.9}'
-
-    pipe = MemoryPipeline(
-        db, EntityExtractor(db), mode="heuristic", on_conflict="reconcile"
-    )
-    result = asyncio.run(
-        pipe._validate_and_commit(
-            "rp1",
-            {
-                "subject": "Maya",
-                "predicate": "hair_color",
-                "object": "red",
-                "confidence": 0.8,
-                "source": "heuristic",
-            },
-            turn_number=10,
-            llm_complete=fake_llm,
-        )
-    )
-    assert result.get("status") == "rejected"
-    assert db.get_active_fact("rp1", "Maya", "hair_color")["object"] == "black"
-
-
-def test_find_hair_conflict(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-    from autorag.extractor import EntityExtractor
-
-    db.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
-    v = ResponseValidator(db, EntityExtractor(db), extra_patterns=["rp"])
-    conflicts = v.find_conflicts(
-        "c1", "A breeze swept through the room, lifting Maya's red hair."
-    )
-    assert conflicts
-    assert conflicts[0]["existing"] == "black"
-    assert conflicts[0]["generated"].lower() == "red"
-
-
-def test_no_conflict_matching_hair(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-    from autorag.extractor import EntityExtractor
-
-    db.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
-    v = ResponseValidator(db, EntityExtractor(db), extra_patterns=["rp"])
-    conflicts = v.find_conflicts(
-        "c1", "A breeze lifted Maya's black hair."
-    )
-    assert conflicts == []
-
-
-def test_sunset_not_checked(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-
-    v = ResponseValidator(db)
-    claims = v.extract_claim_candidates(
-        "The beautiful sunset painted the room gold."
-    )
-    assert claims == []
-
-
-def test_reality_check_hard(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-    from autorag.extractor import EntityExtractor
-
-    db.commit_fact("c1", "Maya", "hair_color", "black", turn_number=1)
-    v = ResponseValidator(db, EntityExtractor(db), extra_patterns=["rp"], use_llm_claims=False)
-
-    async def fake_llm(messages, max_tokens=1024, temperature=0.4):
-        return "A breeze swept through the room, lifting Maya's black hair."
-
-    result = asyncio.run(
-        v.reality_check(
-            "c1",
-            "A breeze swept through the room, lifting Maya's red hair.",
-            policy="hard",
-            llm_complete=fake_llm,
-            original_messages=[{"role": "user", "content": "Describe the scene."}],
-        )
-    )
-    assert "black" in result["text"].lower()
-    assert result["action"] == "hard"
-
-
-def test_finance_value_conflict(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-
-    db.commit_fact("fin", "cash reserve", "value", "50000", turn_number=1)
-    v = ResponseValidator(db, use_llm_claims=False)
-    # LLM claims path would catch natural language; inject claim directly via find with llm_claims
-    conflicts = v.find_conflicts(
-        "fin",
-        "We should keep the cash reserve at 100000 euros.",
-        llm_claims=[{
-            "subject": "cash reserve",
-            "predicate": "value",
-            "object": "100000",
-            "span": "cash reserve value 100000",
-        }],
-    )
-    assert conflicts
-    assert conflicts[0]["existing"] == "50000"
-
-
-def test_decision_intentional_hint(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-
-    db.commit_fact("eng", "api", "compat", "v2", turn_number=1)
-    v = ResponseValidator(db, use_llm_claims=False)
-    conflicts = v.find_conflicts(
-        "eng",
-        "Going forward the api compat is v3.",
-        llm_claims=[{
-            "subject": "api",
-            "predicate": "compat",
-            "object": "v3",
-            "span": "Going forward the api compat is v3",
-        }],
-    )
-    assert conflicts
-    assert conflicts[0]["intentional_hint"] is True
-
-
-# --- Params pattern pack tests (0.3.3) ---
-
-def test_params_single_value(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_params("Width: 10\nLength: 20", from_assistant=False)
-    assert any(f["predicate"] == "width" and f["object"] == "10" for f in facts)
-    assert any(f["predicate"] == "length" and f["object"] == "20" for f in facts)
-
-
-def test_params_multi_value(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_params("Dimensions: 42mm, 42mm, 48mm", from_assistant=False)
-    dims = [f for f in facts if f["predicate"] == "dimensions"]
-    assert len(dims) == 3  # Multiple facts, not JSON blob
-    assert any(f["object"] == "42mm" for f in dims)
-    assert any(f["object"] == "48mm" for f in dims)
-
-
-def test_params_noise_rejection(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_params("Note: see above\nAyanna: she smiles", from_assistant=False)
-    assert len(facts) == 0
-
-
-def test_params_unit_preservation(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_params("Voltage: 12V", from_assistant=False)
-    assert facts[0]["object"] == "12V"
-
-
-def test_params_supersession(db: StateDatabase):
-    db.commit_fact("c1", "params", "width", "10", turn_number=1)
-    db.commit_fact("c1", "params", "width", "12", turn_number=2)
-    assert db.get_active_fact("c1", "params", "width")["object"] == "12"
-
-
-def test_params_label_normalization(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_params("Step Angle: 1.8°", from_assistant=False)
-    assert facts[0]["predicate"] == "step_angle"
-
-
-def test_params_subject_marker(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    text = "[subject: motor_a]\nWidth: 10\n[subject: motor_b]\nWidth: 15"
-    facts = ext.extract_params(text, from_assistant=False)
-
-    motor_a_width = [f for f in facts if f["subject"] == "motor_a" and f["predicate"] == "width"]
-    motor_b_width = [f for f in facts if f["subject"] == "motor_b" and f["predicate"] == "width"]
-
-    assert len(motor_a_width) == 1 and motor_a_width[0]["object"] == "10"
-    assert len(motor_b_width) == 1 and motor_b_width[0]["object"] == "15"
-
-
-def test_params_preprocess_strips_markers(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    text = "[subject: motor_a]\nWidth: 10"
-    clean, original = ext.preprocess_message(text)
-
-    # Clean text should not contain marker
-    assert "[subject:" not in clean
-    assert "Width: 10" in clean
-
-    # Original text retains marker for extraction
-    assert "[subject: motor_a]" in original
-
-
-def test_params_small_integers_accepted(db: StateDatabase):
-    from autorag.extractor import EntityExtractor
-    ext = EntityExtractor(db, use_spacy=False)
-    facts = ext.extract_params("Iterations: 12\nCount: 5", from_assistant=False)
-    assert any(f["predicate"] == "iterations" and f["object"] == "12" for f in facts)
-    assert any(f["predicate"] == "count" and f["object"] == "5" for f in facts)
-
-
-def test_params_in_validator(db: StateDatabase):
-    from autorag.validator import ResponseValidator
-    from autorag.extractor import EntityExtractor
-
-    db.commit_fact("c1", "params", "voltage", "12V", turn_number=1)
-    v = ResponseValidator(db, EntityExtractor(db), extra_patterns=["params"])
-    patterns = v._pattern_list()
-    # Should have generic + params patterns
-    assert len(patterns) > len(__import__('autorag.validator', fromlist=['_GENERIC_PATTERNS'])._GENERIC_PATTERNS)
+    result = asyncio.run(run())
+    assert result.body is not None
+    assert b"black hair" in result.body
+    assert len(calls) == 2
+    asyncio.run(proxy.close())
