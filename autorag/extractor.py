@@ -491,16 +491,16 @@ class EntityExtractor:
                             out.append(self._fact(
                                 subject=subject,
                                 predicate=label,
-                                object=part,
-                                confidence=0.85,
+                                obj=part,
+                                conf=0.85,
                                 from_assistant=from_assistant
                             ))
                     elif len(valid_parts) == 1:
                         out.append(self._fact(
                             subject=subject,
                             predicate=label,
-                            object=valid_parts[0],
-                            confidence=0.9,
+                            obj=valid_parts[0],
+                            conf=0.9,
                             from_assistant=from_assistant
                         ))
                 else:
@@ -521,12 +521,14 @@ class EntityExtractor:
                         out.append(self._fact(
                             subject=subject,
                             predicate=label,
-                            object=raw_value,
-                            confidence=0.9,
+                            obj=raw_value,
+                            conf=0.9,
                             from_assistant=from_assistant
                         ))
 
         return out
+
+
 
 
     def process_turn_heuristic(
